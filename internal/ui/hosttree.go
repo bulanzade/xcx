@@ -106,8 +106,12 @@ func (m hostTreeModel) Update(app *App, msg tea.Msg) (hostTreeModel, tea.Cmd) {
 		return m.openSFTP(app)
 	case "e":
 		n := m.flat[m.cur]
-		if n.kind == nodeHost {
+		switch n.kind {
+		case nodeHost:
 			app.edit = newEditModel(app, editKindHost, n.groupIdx, n.hostIdx)
+			app.view = viewEdit
+		case nodeGroup:
+			app.edit = newEditModel(app, editKindGroup, n.groupIdx, n.hostIdx)
 			app.view = viewEdit
 		}
 	case "n":
