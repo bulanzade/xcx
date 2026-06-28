@@ -4,6 +4,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,10 @@ import (
 
 	"xcx/internal/ui"
 )
+
+// version is the build version, injected via -ldflags "-X main.version=..." in
+// the release workflow. "dev" is the default for local builds.
+var version = "dev"
 
 // configDir resolves the per-user configuration directory for xcx
 // (~/.config/xcx on Unix, %AppData%\xcx on Windows), creating it on demand.
@@ -28,6 +33,13 @@ func configDir() (string, error) {
 }
 
 func main() {
+	showVersion := flag.Bool("version", false, "print version and exit")
+	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
+
 	dir, err := configDir()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "xcx: cannot init config dir: %v\n", err)

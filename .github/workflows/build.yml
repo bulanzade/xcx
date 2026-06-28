@@ -53,17 +53,30 @@ jobs:
         run: |
           if [ "${{ matrix.goos }}" = "windows" ]; then
             echo "bin=xcx.exe" >> "$GITHUB_OUTPUT"
-            echo "platform=windows-${{ matrix.goarch }}" >> "$GITHUB_OUTPUT"
           else
             echo "bin=xcx" >> "$GITHUB_OUTPUT"
-            echo "platform=xcx-${{ matrix.goos }}-${{ matrix.goarch }}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "platform=xcx-${{ matrix.goos }}-${{ matrix.goarch }}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine version
+        id: ver
+        run: |
+          # tag push -> use the tag name (e.g. v1.0.0); otherwise dev build
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "v=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "v=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build
+        env:
+          XCX_VERSION: ${{ steps.ver.outputs.v }}
         run: |
           mkdir -p dist
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
-            go build -trimpath -ldflags="-s -w" -o "dist/${{ steps.name.outputs.bin }}" .
+            go build -trimpath \
+            -ldflags="-s -w -X main.version=${XCX_VERSION}" \
+            -o "dist/${{ steps.name.outputs.bin }}" .
 
       - name: Archive
         id: archive
