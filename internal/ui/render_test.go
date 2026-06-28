@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/lipgloss"
+
 	"xcx/internal/sshterm"
 )
 
@@ -152,6 +154,39 @@ func TestRender_TopReverseHeaderEndToEnd(t *testing.T) {
 	}
 	if !hasSGR(got, "7") {
 		t.Fatalf("reverse-video SGR (CSI 7m) missing from rendered header: %q", got)
+	}
+}
+
+func TestRender_TopLocalizedHeaderKeepsReset(t *testing.T) {
+	screen := sshterm.NewScreen(12)
+	p := sshterm.NewParser(screen)
+	p.Write([]byte("\x1b[7m进程号 USER\x1b[0m\r\nplain"))
+
+	view := screen.View(2)
+	header := renderRow(view[0], 12, -1)
+	body := renderRow(view[1], 12, -1)
+	if !strings.Contains(header, "\x1b[0m") {
+		t.Fatalf("localized reverse header must keep reset sequence: %q", header)
+	}
+	if hasSGR(body, "7") {
+		t.Fatalf("body row inherited reverse-video style: %q", body)
+	}
+}
+
+func TestRenderRow_LocalizedHeaderDoesNotWrap(t *testing.T) {
+	text := "进程号 USER"
+	row := make([]sshterm.Cell, 12)
+	i := 0
+	for _, ch := range text {
+		row[i] = sshterm.Cell{Ch: ch, Style: sshterm.Style{Rev: true, Fg: -1, Bg: -1}}
+		i++
+	}
+	got := renderRow(row, 12, -1)
+	if width := lipgloss.Width(got); width > 12 {
+		t.Fatalf("localized header render width = %d, want <= 12; got %q", width, got)
+	}
+	if !strings.Contains(got, "\x1b[0m") {
+		t.Fatalf("localized header must keep reset sequence: %q", got)
 	}
 }
 

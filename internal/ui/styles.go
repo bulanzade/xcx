@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"xcx/internal/sshterm"
 )
@@ -102,7 +103,8 @@ func renderRow(row []sshterm.Cell, width, cursorCol int) string {
 		styled = false
 	}
 
-	for c := 0; c < width; c++ {
+	used := 0
+	for c := 0; c < width && used < width; c++ {
 		var cell sshterm.Cell
 		if c < len(row) {
 			cell = row[c]
@@ -110,6 +112,14 @@ func renderRow(row []sshterm.Cell, width, cursorCol int) string {
 		ch := cell.Ch
 		if ch == 0 {
 			ch = ' '
+		}
+		chWidth := runewidth.RuneWidth(ch)
+		if chWidth < 1 {
+			chWidth = 1
+		}
+		if used+chWidth > width {
+			ch = ' '
+			chWidth = width - used
 		}
 		st := cell.Style
 		if c == cursorCol {
@@ -130,6 +140,7 @@ func renderRow(row []sshterm.Cell, width, cursorCol int) string {
 			styled = !def
 		}
 		seg.WriteRune(ch)
+		used += chWidth
 	}
 	flush()
 	return b.String()

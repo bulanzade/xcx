@@ -8,7 +8,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"xcx/internal/session"
 	"xcx/internal/sshterm"
@@ -195,10 +194,6 @@ func (m terminalModel) View(app *App) string {
 			cursorCol = curCol
 		}
 		s := renderRow(row, w, cursorCol)
-		// trim to the visible width (renderRow already pads to w with spaces)
-		if lipgloss.Width(s) > w {
-			s = s[:w]
-		}
 		b.WriteString(s)
 		b.WriteString("\n")
 	}
