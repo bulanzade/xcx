@@ -10,15 +10,17 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"xcx/internal/session"
 	"xcx/internal/sshterm"
 )
 
 // terminalModel owns an sshterm.Terminal attached to the active session.
 type terminalModel struct {
-	term    *sshterm.Terminal
-	ctx     context.Context
-	cancel  context.CancelFunc
-	ticking bool
+	term       *sshterm.Terminal
+	ctx        context.Context
+	cancel     context.CancelFunc
+	ticking    bool
+	writeInput func([]byte) error
 }
 
 func newTerminalModel() terminalModel {
@@ -27,34 +29,39 @@ func newTerminalModel() terminalModel {
 
 // openTerminalCmd starts the terminal once a session is attached. It returns a
 // tea.Cmd that performs the PTY setup in a goroutine and emits a message.
-func openTerminalCmd(app *App) tea.Cmd {
+func openTerminalCmd(app *App, sess *session.Session, connKey string) tea.Cmd {
+	w, h := app.RightSize()
 	return func() tea.Msg {
-		tm := &app.terminal
-		if app.sess == nil {
+		if sess == nil {
 			return terminalErrorMsg{err: fmt.Errorf("no session")}
 		}
-		w, h := app.RawSize()
-		sshSess, err := app.sess.Client().NewSession()
+		sshSess, err := sess.Client().NewSession()
 		if err != nil {
-			return terminalErrorMsg{err: fmt.Errorf("new session: %w", err)}
+			return terminalErrorMsg{sess: sess, err: fmt.Errorf("new session: %w", err)}
 		}
 		term, err := sshterm.NewTerminal(sshSess, w, h)
 		if err != nil {
-			return terminalErrorMsg{err: err}
+			return terminalErrorMsg{sess: sess, err: err}
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		tm.ctx, tm.cancel = ctx, cancel
 		term.Start(ctx)
-		tm.term = term
-		tm.ticking = true
-		return terminalStartedMsg{}
+		return terminalStartedMsg{sess: sess, key: connKey, term: term, ctx: ctx, cancel: cancel}
 	}
 }
 
-type terminalStartedMsg struct{}
-type terminalErrorMsg struct{ err error }
+type terminalStartedMsg struct {
+	sess   *session.Session
+	key    string
+	term   *sshterm.Terminal
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+type terminalErrorMsg struct {
+	sess *session.Session
+	err  error
+}
 type terminalRefreshMsg struct{}
-type terminalDoneMsg struct{}
+type terminalDoneMsg struct{ term *sshterm.Terminal }
 
 func terminalRefresh() tea.Cmd {
 	return tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg { return terminalRefreshMsg{} })
@@ -63,22 +70,49 @@ func terminalRefresh() tea.Cmd {
 func waitForTerminalDone(t *sshterm.Terminal) tea.Cmd {
 	return func() tea.Msg {
 		<-t.Done()
-		return terminalDoneMsg{}
+		return terminalDoneMsg{term: t}
 	}
 }
 
 func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case terminalStartedMsg:
+		app.storeActiveTerminal()
+		m.term = msg.term
+		m.ctx = msg.ctx
+		m.cancel = msg.cancel
+		m.ticking = true
+		app.sess = msg.sess
+		app.activeHostKey = msg.key
+		if app.activeHostKey == "" {
+			app.activeHostKey = hostConnKey(msg.sess.Host)
+		}
+		app.ensureSessionMaps()
+		app.sessions[app.activeHostKey] = msg.sess
+		app.terminals[app.activeHostKey] = m
+		app.status = fmt.Sprintf("connected to %s", msg.sess.Host.Name)
+		app.err = ""
+		app.right = rightTerminal
+		app.focus = focusRight
+		if m.term == nil {
+			return m, nil
+		}
 		return m, tea.Batch(terminalRefresh(), waitForTerminalDone(m.term))
 	case terminalErrorMsg:
 		app.err = fmt.Sprintf("terminal: %v", msg.err)
-		app.closeTerminal()
-		app.view = viewHostTree
+		if msg.sess != nil && app.sess != msg.sess {
+			_ = msg.sess.Close()
+		} else if app.sess == msg.sess {
+			app.closeTerminal()
+		}
 		return m, nil
 	case terminalRefreshMsg:
 		return m, terminalRefresh()
 	case terminalDoneMsg:
+		if msg.term != nil && m.term != msg.term {
+			app.removeBackgroundTerminal(msg.term)
+			return m, nil
+		}
 		// Done() fires on three causes; report each accurately and only return
 		// to the host tree when the shell truly ended (clean exit or real
 		// error). We capture err before closeTerminal() clears the terminal.
@@ -100,28 +134,42 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 			app.status = "session ended"
 			app.err = fmt.Sprintf("terminal: %v", termErr)
 		}
-		app.view = viewHostTree
 		return m, nil
 	case tea.WindowSizeMsg:
 		if m.term != nil {
-			w, h := app.RawSize()
+			w, h := app.RightSize()
 			_ = m.term.Resize(w, h)
 		}
 		return m, nil
 	case tea.KeyMsg:
-		// Ctrl+\ handled by the top-level app to leave the terminal.
-		if msg.Type == tea.KeyCtrlBackslash {
+		if m.term == nil && m.writeInput == nil {
 			return m, nil
 		}
-		if m.term == nil {
+		switch msg.Type {
+		case tea.KeyCtrlBackslash:
+			app.closeTerminal()
+			return m, nil
+		case tea.KeyCtrlS:
+			app.openSFTPFromTerminal()
 			return m, nil
 		}
-		if err := m.term.WriteInput(encodeKey(msg)); err != nil {
+		if err := m.write(encodeKey(msg)); err != nil {
 			app.err = fmt.Sprintf("write: %v", err)
 		}
 		return m, nil
 	}
 	return m, nil
+}
+
+func (m terminalModel) write(input []byte) error {
+	if m.writeInput != nil {
+		return m.writeInput(input)
+	}
+	return m.term.WriteInput(input)
+}
+
+func (m terminalModel) available() bool {
+	return m.term != nil || m.writeInput != nil
 }
 
 // View renders the current screen contents, applying each cell's SGR style
@@ -131,7 +179,7 @@ func (m terminalModel) View(app *App) string {
 	if m.term == nil {
 		return dimStyle.Render("starting terminal…")
 	}
-	w, h := app.RawSize()
+	w, h := app.RightSize()
 	screen := m.term.Screen()
 	view := screen.View(h)
 	curRow, curCol := screen.CursorInView(h)

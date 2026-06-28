@@ -2,11 +2,16 @@ package ui
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"xcx/internal/session"
+	"xcx/internal/sshterm"
 	"xcx/internal/transfer"
 	"xcx/internal/vault"
 )
@@ -15,12 +20,27 @@ import (
 type view int
 
 const (
-	viewUnlock view = iota
-	viewHostTree
-	viewTerminal
-	viewSFTP
-	viewHostKeyPrompt // modal-ish: confirm an unknown host key
-	viewEdit          // add/edit a host
+	viewUnlock        view = iota
+	viewHostKeyPrompt      // modal-ish: confirm an unknown host key
+	viewEdit               // add/edit a host
+	viewMain               // persistent split layout
+)
+
+// rightPane is the active panel on the right side of the split view.
+type rightPane int
+
+const (
+	rightPlaceholder rightPane = iota
+	rightTerminal
+	rightSFTP
+)
+
+// focus identifies which split pane receives keyboard input.
+type focus int
+
+const (
+	focusLeft focus = iota
+	focusRight
 )
 
 // Options configure how the App is built (paths, callbacks for vault ops).
@@ -39,7 +59,9 @@ type App struct {
 
 	width, height int
 
-	view view
+	view  view
+	right rightPane
+	focus focus
 
 	// services
 	vault    *vault.Vault
@@ -48,7 +70,11 @@ type App struct {
 	queue    *transfer.Queue
 
 	// active connection
-	sess *session.Session
+	sess          *session.Session
+	activeHostKey string
+	activeSFTPKey string
+	sessions      map[string]*session.Session
+	terminals     map[string]terminalModel
 
 	// child view state
 	unlock   unlockModel
@@ -59,8 +85,22 @@ type App struct {
 	edit     editModel
 
 	// transient status line content
-	status string
-	err    string
+	status   string
+	err      string
+	statusMu sync.RWMutex
+	transfer transferStatus
+}
+
+type transferStatus struct {
+	active    bool
+	label     string
+	done      int64
+	total     int64
+	queueLeft int
+	started   time.Time
+	updated   time.Time
+	speedBps  float64
+	err       string
 }
 
 // New returns a new App initialized for the unlock screen.
@@ -85,41 +125,107 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		a.width, a.height = msg.Width, msg.Height
 		a.propagateSize()
+		if a.view == viewMain {
+			_, cmd := a.dispatchRight(msg)
+			return a, cmd
+		}
 		return a, nil
 
-	case tea.KeyMsg:
-		// Global hotkeys (only when not typing in a text field / terminal):
-		if a.view != viewTerminal && a.view != viewUnlock && a.view != viewEdit {
-			switch msg.Type {
-			case tea.KeyCtrlC:
-				return a, tea.Quit
-			case tea.KeyCtrlQ:
-				return a, tea.Quit
-			}
-		}
-		if a.view == viewTerminal && msg.Type == tea.KeyCtrlBackslash {
-			// leave terminal back to host tree
-			a.closeTerminal()
-			a.view = viewHostTree
-			return a, nil
-		}
 	case dialResultMsg:
 		// An async SSH dial completed (terminal or SFTP). Route the result
 		// without blocking — the dial already ran in a goroutine via dialCmd.
 		return a, a.handleDialResult(msg)
+
+	case terminalStartedMsg, terminalErrorMsg, terminalDoneMsg, terminalRefreshMsg:
+		var cmd tea.Cmd
+		a.terminal, cmd = a.terminal.Update(a, msg)
+		return a, cmd
+
+	case tea.KeyMsg:
+		if a.view != viewMain {
+			return a.dispatchModal(msg)
+		}
+
+		switch msg.Type {
+		case tea.KeyCtrlC, tea.KeyCtrlQ:
+			if a.focus == focusRight && a.right == rightTerminal {
+				return a.dispatchRight(msg)
+			}
+			return a.quit()
+		case tea.KeyShiftTab:
+			return a.handleShiftTab()
+		case tea.KeyTab:
+			return a.handleTab()
+		}
+
+		if a.focus == focusLeft {
+			var cmd tea.Cmd
+			a.hostTree, cmd = a.hostTree.Update(a, msg)
+			return a, cmd
+		}
+		return a.dispatchRight(msg)
 	}
 
-	// Dispatch to the active view.
+	if a.view == viewMain {
+		a.hostTree, _ = a.hostTree.Update(a, msg)
+		_, cmd := a.dispatchRight(msg)
+		return a, cmd
+	}
+	return a.dispatchModal(msg)
+}
+
+func (a *App) handleTab() (tea.Model, tea.Cmd) {
+	if a.right == rightTerminal && a.focus == focusRight {
+		return a.dispatchRight(tea.KeyMsg{Type: tea.KeyTab})
+	}
+	if a.right != rightSFTP {
+		if a.focus == focusLeft {
+			a.focus = focusRight
+		} else {
+			a.focus = focusLeft
+		}
+		return a, nil
+	}
+	if a.focus == focusLeft {
+		a.focus = focusRight
+		if a.sftp.local != nil {
+			a.sftp.focused = a.sftp.local
+		}
+		return a, nil
+	}
+	if a.sftp.focused == a.sftp.remote {
+		a.focus = focusLeft
+		if a.sftp.local != nil {
+			a.sftp.focused = a.sftp.local
+		}
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.sftp, cmd = a.sftp.Update(a, tea.KeyMsg{Type: tea.KeyTab})
+	return a, cmd
+}
+
+func (a *App) handleShiftTab() (tea.Model, tea.Cmd) {
+	if a.view != viewMain {
+		return a, nil
+	}
+	if a.focus == focusRight {
+		a.focus = focusLeft
+		return a, nil
+	}
+	a.focus = focusRight
+	return a, nil
+}
+
+// dispatchModal routes messages to full-screen modal views.
+func (a *App) dispatchModal(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if k, ok := msg.(tea.KeyMsg); ok && (k.Type == tea.KeyCtrlC || k.Type == tea.KeyCtrlQ) {
+		return a.quit()
+	}
 	var cmd tea.Cmd
 	switch a.view {
 	case viewUnlock:
 		a.unlock, cmd = a.unlock.Update(a, msg)
-	case viewHostTree:
-		a.hostTree, cmd = a.hostTree.Update(a, msg)
-	case viewTerminal:
-		a.terminal, cmd = a.terminal.Update(a, msg)
-	case viewSFTP:
-		a.sftp, cmd = a.sftp.Update(a, msg)
 	case viewHostKeyPrompt:
 		a.hostKey, cmd = a.hostKey.Update(a, msg)
 	case viewEdit:
@@ -128,31 +234,78 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return a, cmd
 }
 
+// dispatchRight routes messages to the active right pane.
+func (a *App) dispatchRight(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch a.right {
+	case rightTerminal:
+		var cmd tea.Cmd
+		a.terminal, cmd = a.terminal.Update(a, msg)
+		return a, cmd
+	case rightSFTP:
+		var cmd tea.Cmd
+		a.sftp, cmd = a.sftp.Update(a, msg)
+		return a, cmd
+	default:
+		return a, nil
+	}
+}
+
 // View renders the active screen.
 func (a *App) View() string {
-	var body string
 	switch a.view {
 	case viewUnlock:
-		body = a.unlock.View(a)
-	case viewHostTree:
-		body = a.hostTree.View(a)
-	case viewTerminal:
-		body = a.terminal.View(a)
-	case viewSFTP:
-		body = a.sftp.View(a)
+		return a.framedModal(a.unlock.View(a))
 	case viewHostKeyPrompt:
-		body = a.hostKey.View(a)
+		return a.framedModal(a.hostKey.View(a))
 	case viewEdit:
-		body = a.edit.View(a)
+		return a.framedModal(a.edit.View(a))
 	default:
-		body = "(unknown view)"
+		return a.viewSplit()
+	}
+}
+
+// viewSplit renders the persistent split: left host tree, right activity pane,
+// and a full-width status bar.
+func (a *App) viewSplit() string {
+	leftW, _, paneH := a.layout()
+
+	leftBody := a.hostTree.View(a)
+	leftStyle := leftPaneStyle
+	if a.focus == focusLeft {
+		leftStyle = leftPaneActiveStyle
+	}
+	left := leftStyle.Width(max(1, leftW-2)).Height(max(1, paneH-2)).Render(leftBody)
+
+	var right string
+	switch a.right {
+	case rightTerminal:
+		style := rightPaneStyle
+		if a.focus == focusRight {
+			style = rightPaneActiveStyle
+		}
+		right = style.Width(max(1, a.RightOuterWidth()-2)).Height(max(1, paneH-2)).Render(a.terminal.View(a))
+	case rightSFTP:
+		right = a.sftp.View(a)
+	default:
+		right = a.placeholderView()
 	}
 
-	// The terminal view is full-screen raw; it does not get the frame/status.
-	if a.view == viewTerminal {
-		return body
+	body := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
+	out := body
+	if a.err != "" {
+		out += "\n" + errorStyle.Render(a.err)
 	}
+	out += "\n" + a.statusBar()
+	return out
+}
 
+func (a *App) placeholderView() string {
+	w, h := a.RightSize()
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center,
+		dimStyle.Render("Select a host and press Enter to connect."))
+}
+
+func (a *App) framedModal(body string) string {
 	out := appFrame.Render(body)
 	if a.err != "" {
 		out += "\n" + errorStyle.Render(a.err)
@@ -163,7 +316,13 @@ func (a *App) View() string {
 
 // statusBar renders the persistent bottom bar.
 func (a *App) statusBar() string {
+	a.statusMu.RLock()
 	left := a.status
+	ts := a.transfer
+	a.statusMu.RUnlock()
+	if ts.active {
+		left = ts.String()
+	}
 	if left == "" {
 		left = "xcx — TUI SSH manager"
 	}
@@ -183,8 +342,79 @@ func (a *App) statusBar() string {
 	if fill < 1 {
 		fill = 1
 	}
-	bar := left + " " + repeatChar(' ', fill) + " " + right
+	bar := left + " " + strings.Repeat(" ", fill) + " " + right
 	return statusBarStyle.Render(bar)
+}
+
+func (s transferStatus) String() string {
+	name := filepath.Base(s.label)
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		name = s.label
+	}
+	if s.err != "" {
+		return fmt.Sprintf("transfer failed %s: %s", name, s.err)
+	}
+	pct := 0
+	if s.total > 0 {
+		pct = int(float64(s.done) * 100 / float64(s.total))
+		if pct > 100 {
+			pct = 100
+		}
+	}
+	queue := ""
+	if s.queueLeft > 0 {
+		queue = fmt.Sprintf(" (%d queued)", s.queueLeft)
+	}
+	return fmt.Sprintf("transferring %s %d%% %s/s%s", name, pct, formatBytes(int64(s.speedBps)), queue)
+}
+
+func (a *App) updateTransferProgress(p transfer.Progress, started time.Time) {
+	now := time.Now()
+	elapsed := now.Sub(started).Seconds()
+	speed := 0.0
+	if elapsed > 0 {
+		speed = float64(p.Done) / elapsed
+	}
+	a.statusMu.Lock()
+	a.transfer = transferStatus{
+		active:    true,
+		label:     p.Job.Src,
+		done:      p.Done,
+		total:     p.Total,
+		queueLeft: p.QueueLeft,
+		started:   started,
+		updated:   now,
+		speedBps:  speed,
+	}
+	a.statusMu.Unlock()
+}
+
+func (a *App) finishTransfer(c transfer.Completed) {
+	a.statusMu.Lock()
+	defer a.statusMu.Unlock()
+	if c.Job.Status == transfer.StatusFailed {
+		a.transfer = transferStatus{
+			active: true,
+			label:  c.Job.Src,
+			err:    c.Job.Err,
+		}
+		return
+	}
+	a.transfer = transferStatus{}
+	a.status = fmt.Sprintf("transferred %s", filepath.Base(c.Job.Src))
+}
+
+func formatBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for n >= div*unit && exp < 4 {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func (a *App) propagateSize() {
@@ -192,11 +422,131 @@ func (a *App) propagateSize() {
 }
 
 func (a *App) closeTerminal() {
+	key := a.currentHostKey()
+	a.closeTerminalKey(key, true)
+	a.sess = nil
+	a.activeHostKey = ""
+	a.terminal = newTerminalModel()
+	a.right = rightPlaceholder
+	a.focus = focusLeft
+}
+
+func (a *App) closeTerminalKey(key string, closeSession bool) {
+	if key == "" {
+		return
+	}
+	a.ensureSessionMaps()
+	if key == a.currentHostKey() {
+		a.terminal.close()
+	} else if tm, ok := a.terminals[key]; ok {
+		tm.close()
+	}
+	delete(a.terminals, key)
+	if closeSession && key != a.activeSFTPKey {
+		if sess := a.sessions[key]; sess != nil {
+			_ = sess.Close()
+		}
+		if key == a.currentHostKey() && a.sess != nil {
+			_ = a.sess.Close()
+		}
+		delete(a.sessions, key)
+		if key == a.currentHostKey() {
+			a.sess = nil
+			a.activeHostKey = ""
+		}
+	}
+}
+
+func (a *App) closeSessionKey(key string) {
+	if key == "" {
+		return
+	}
+	if key == a.activeSFTPKey {
+		a.sftp.close()
+		a.activeSFTPKey = ""
+		if a.right == rightSFTP {
+			a.right = rightPlaceholder
+			a.focus = focusLeft
+		}
+	}
+	a.closeTerminalKey(key, true)
+	if sess := a.sessions[key]; sess != nil {
+		_ = sess.Close()
+	}
+	delete(a.sessions, key)
+	if key == a.currentHostKey() {
+		a.sess = nil
+		a.activeHostKey = ""
+		a.terminal = newTerminalModel()
+	}
+}
+
+func (a *App) removeBackgroundTerminal(t *sshterm.Terminal) {
+	if t == nil {
+		return
+	}
+	a.ensureSessionMaps()
+	for key, tm := range a.terminals {
+		if tm.term == t {
+			tm.close()
+			delete(a.terminals, key)
+			if key != a.activeSFTPKey {
+				if sess := a.sessions[key]; sess != nil {
+					_ = sess.Close()
+				}
+				delete(a.sessions, key)
+			}
+			return
+		}
+	}
+}
+
+func (a *App) shutdown() {
+	a.sftp.close()
+	a.activeSFTPKey = ""
 	a.terminal.close()
+	closed := map[*session.Session]bool{}
 	if a.sess != nil {
 		_ = a.sess.Close()
-		a.sess = nil
+		closed[a.sess] = true
 	}
+	a.ensureSessionMaps()
+	for _, tm := range a.terminals {
+		tm.close()
+	}
+	for _, sess := range a.sessions {
+		if sess != nil && !closed[sess] {
+			_ = sess.Close()
+			closed[sess] = true
+		}
+	}
+	a.sessions = nil
+	a.terminals = nil
+	a.sess = nil
+	a.activeHostKey = ""
+	a.terminal = newTerminalModel()
+}
+
+func (a *App) quit() (tea.Model, tea.Cmd) {
+	a.shutdown()
+	return a, tea.Quit
+}
+
+// openSFTPFromTerminal opens the right-side SFTP pane using the current SSH
+// session.
+func (a *App) openSFTPFromTerminal() {
+	if a.sess == nil {
+		return
+	}
+	sm, err := newSFTPModel(a)
+	if err != nil {
+		a.err = fmt.Sprintf("sftp: %v", err)
+		return
+	}
+	a.sftp = sm
+	a.activeSFTPKey = a.currentHostKey()
+	a.right = rightSFTP
+	a.focus = focusRight
 }
 
 // --- accessors used by child views --------------------------------------
@@ -232,19 +582,191 @@ func (a *App) RawSize() (int, int) {
 	return w, h
 }
 
+// layout returns split pane sizes: left width, right width, and pane height.
+func (a *App) layout() (int, int, int) {
+	const (
+		leftTarget = 36
+		gap        = 1
+		rightMin   = 30
+		leftFloor  = 22
+	)
+	paneH := a.height - 1
+	if paneH < 1 {
+		paneH = 1
+	}
+	leftW := leftTarget
+	rightW := a.width - leftW - gap
+	if rightW < rightMin {
+		leftW = a.width - gap - rightMin
+		if leftW < leftFloor {
+			leftW = leftFloor
+		}
+		rightW = a.width - leftW - gap
+	}
+	if leftW < 1 {
+		leftW = 1
+	}
+	if rightW < 1 {
+		rightW = 1
+	}
+	return leftW, rightW, paneH
+}
+
+// LeftSize returns the host-tree content size inside the left pane border.
+func (a *App) LeftSize() (int, int) {
+	leftW, _, paneH := a.layout()
+	w := leftW - 2
+	h := paneH - 2
+	if w < 1 {
+		w = 1
+	}
+	if h < 1 {
+		h = 1
+	}
+	return w, h
+}
+
+// RightSize returns the content size of the right activity pane.
+func (a *App) RightSize() (int, int) {
+	_, rightW, paneH := a.layout()
+	if a.right == rightTerminal {
+		rightW -= 2
+		paneH -= 2
+	}
+	if rightW < 1 {
+		rightW = 1
+	}
+	if paneH < 1 {
+		paneH = 1
+	}
+	return rightW, paneH
+}
+
+// RightOuterWidth returns the full right pane width before any child border is
+// applied.
+func (a *App) RightOuterWidth() int {
+	_, rightW, _ := a.layout()
+	if rightW < 1 {
+		return 1
+	}
+	return rightW
+}
+
 // Width returns the full terminal width.
 func (a *App) Width() int { return a.width }
 
 // Height returns the full terminal height.
 func (a *App) Height() int { return a.height }
 
-func repeatChar(ch rune, n int) string {
-	if n <= 0 {
+func (a *App) ensureSessionMaps() {
+	if a.sessions == nil {
+		a.sessions = map[string]*session.Session{}
+	}
+	if a.terminals == nil {
+		a.terminals = map[string]terminalModel{}
+	}
+}
+
+func hostConnKey(h *vault.Host) string {
+	if h == nil {
 		return ""
 	}
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = byte(ch)
+	return fmt.Sprintf("%s|%s|%s|%d", h.Name, h.User, h.Addr, portOr22(h.Port))
+}
+
+func (a *App) storeActiveTerminal() {
+	if a.sess == nil {
+		return
 	}
-	return string(b)
+	if a.activeHostKey == "" {
+		a.activeHostKey = hostConnKey(a.sess.Host)
+	}
+	if a.activeHostKey == "" {
+		return
+	}
+	a.ensureSessionMaps()
+	a.sessions[a.activeHostKey] = a.sess
+	if a.terminal.available() {
+		a.terminals[a.activeHostKey] = a.terminal
+	}
+}
+
+func (a *App) currentHostKey() string {
+	if a.activeHostKey != "" {
+		return a.activeHostKey
+	}
+	if a.sess != nil {
+		return hostConnKey(a.sess.Host)
+	}
+	return ""
+}
+
+func (a *App) sessionForHost(h *vault.Host) *session.Session {
+	return a.sessionForKey(h, hostConnKey(h))
+}
+
+func (a *App) sessionForKey(h *vault.Host, key string) *session.Session {
+	if key == "" {
+		return nil
+	}
+	if a.sess != nil && (a.activeHostKey == key || (h != nil && hostConnKey(a.sess.Host) == hostConnKey(h))) {
+		return a.sess
+	}
+	a.ensureSessionMaps()
+	return a.sessions[key]
+}
+
+func (a *App) keyForSession(sess *session.Session) string {
+	if sess == nil {
+		return ""
+	}
+	if a.sess == sess && a.activeHostKey != "" {
+		return a.activeHostKey
+	}
+	a.ensureSessionMaps()
+	for key, cached := range a.sessions {
+		if cached == sess {
+			return key
+		}
+	}
+	return hostConnKey(sess.Host)
+}
+
+func (a *App) connectedKeys() map[string]bool {
+	keys := map[string]bool{}
+	if key := a.currentHostKey(); key != "" && a.sess != nil {
+		keys[key] = true
+	}
+	a.ensureSessionMaps()
+	for key, sess := range a.sessions {
+		if sess != nil {
+			keys[key] = true
+		}
+	}
+	return keys
+}
+
+func (a *App) restoreTerminalForHost(h *vault.Host) bool {
+	return a.restoreTerminalForKey(h, hostConnKey(h))
+}
+
+func (a *App) restoreTerminalForKey(h *vault.Host, key string) bool {
+	if key == "" {
+		return false
+	}
+	a.ensureSessionMaps()
+	sess := a.sessionForKey(h, key)
+	tm, ok := a.terminals[key]
+	if !ok || sess == nil || !tm.available() {
+		return false
+	}
+	a.storeActiveTerminal()
+	a.sess = sess
+	a.terminal = tm
+	a.activeHostKey = key
+	a.right = rightTerminal
+	a.focus = focusRight
+	a.status = fmt.Sprintf("connected to %s", h.Name)
+	a.err = ""
+	return true
 }

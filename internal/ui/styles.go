@@ -164,6 +164,10 @@ var (
 	successStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#9ECE6A"))
 
+	connectedStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#9ECE6A"))
+
 	// cursorStyle highlights the selected list row.
 	cursorStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -188,6 +192,23 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("#7AA2F7")).
 			Padding(0, 1)
+
+	// leftPaneStyle frames the persistent host tree.
+	leftPaneStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#565F89"))
+
+	leftPaneActiveStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#7AA2F7"))
+
+	rightPaneStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#565F89"))
+
+	rightPaneActiveStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#7AA2F7"))
 
 	// dirStyle colors directory entries.
 	dirStyle = lipgloss.NewStyle().

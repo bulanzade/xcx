@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
 
 	"xcx/internal/session"
 	"xcx/internal/vault"
@@ -137,18 +138,21 @@ func (m hostTreeModel) activate(app *App) (hostTreeModel, tea.Cmd) {
 		m.rebuild(app)
 		return m, nil
 	}
-	host := app.vault.Groups[n.groupIdx].Hosts[n.hostIdx]
-	return m.connectHost(app, &host)
+	host := &app.vault.Groups[n.groupIdx].Hosts[n.hostIdx]
+	return m.connectHost(app, host, nodeConnKey(n.groupIdx, n.hostIdx))
 }
 
 // connectHost kicks off an async dial for the terminal view. The actual
 // session.Connect runs in a tea.Cmd (a goroutine) so a slow/unreachable host
 // does not freeze the TUI; the result arrives as dialResultMsg, handled by
 // App.Update.
-func (m hostTreeModel) connectHost(app *App, host *vault.Host) (hostTreeModel, tea.Cmd) {
+func (m hostTreeModel) connectHost(app *App, host *vault.Host, connKey string) (hostTreeModel, tea.Cmd) {
+	if app.restoreTerminalForKey(host, connKey) {
+		return m, nil
+	}
 	app.status = fmt.Sprintf("connecting to %s…", host.Name)
 	app.err = ""
-	return m, dialCmd(app, host, false)
+	return m, dialCmd(app, host, connKey, false)
 }
 
 func (m hostTreeModel) openSFTP(app *App) (hostTreeModel, tea.Cmd) {
@@ -156,27 +160,34 @@ func (m hostTreeModel) openSFTP(app *App) (hostTreeModel, tea.Cmd) {
 	if n.kind != nodeHost {
 		return m, nil
 	}
-	host := app.vault.Groups[n.groupIdx].Hosts[n.hostIdx]
+	host := &app.vault.Groups[n.groupIdx].Hosts[n.hostIdx]
+	connKey := nodeConnKey(n.groupIdx, n.hostIdx)
 	// reuse existing session for the same host, else dial fresh (async)
-	if app.sess != nil && app.sess.Host.Name == host.Name {
+	if sess := app.sessionForKey(host, connKey); sess != nil {
+		oldSess := app.sess
+		app.sess = sess
 		sm, err := newSFTPModel(app)
 		if err != nil {
+			app.sess = oldSess
 			app.err = fmt.Sprintf("sftp: %v", err)
 			return m, nil
 		}
 		app.sftp = sm
-		app.view = viewSFTP
+		app.activeSFTPKey = connKey
+		app.right = rightSFTP
+		app.focus = focusRight
 		return m, nil
 	}
 	app.status = fmt.Sprintf("connecting to %s…", host.Name)
 	app.err = ""
-	return m, dialCmd(app, &host, true)
+	return m, dialCmd(app, host, connKey, true)
 }
 
 // dialResultMsg is emitted when an async session.Connect completes. Exactly one
 // of sess / hke / err is meaningful.
 type dialResultMsg struct {
 	host    *vault.Host
+	key     string
 	sess    *session.Session
 	hke     *session.HostKeyError
 	err     error
@@ -186,18 +197,18 @@ type dialResultMsg struct {
 // dialCmd returns a tea.Cmd that dials host off the UI goroutine and emits the
 // result. The host pointer is captured so the caller can be cancelled/edited
 // meanwhile without affecting the in-flight dial's copy.
-func dialCmd(app *App, host *vault.Host, forSFTP bool) tea.Cmd {
+func dialCmd(app *App, host *vault.Host, connKey string, forSFTP bool) tea.Cmd {
 	verifier := app.verifier
 	return func() tea.Msg {
 		sess, err := session.Connect(host, session.DialOptions{Verifier: verifier})
 		switch {
 		case err == nil:
-			return dialResultMsg{host: host, sess: sess, forSFTP: forSFTP}
+			return dialResultMsg{host: host, key: connKey, sess: sess, forSFTP: forSFTP}
 		default:
 			if hke, ok := session.IsHostKeyError(err); ok {
-				return dialResultMsg{host: host, hke: hke, forSFTP: forSFTP}
+				return dialResultMsg{host: host, key: connKey, hke: hke, forSFTP: forSFTP}
 			}
-			return dialResultMsg{host: host, err: err, forSFTP: forSFTP}
+			return dialResultMsg{host: host, key: connKey, err: err, forSFTP: forSFTP}
 		}
 	}
 }
@@ -208,25 +219,34 @@ func dialCmd(app *App, host *vault.Host, forSFTP bool) tea.Cmd {
 func (a *App) handleDialResult(msg dialResultMsg) tea.Cmd {
 	switch {
 	case msg.sess != nil:
-		a.sess = msg.sess
-		a.status = fmt.Sprintf("connected to %s", msg.host.Name)
 		a.err = ""
 		if msg.forSFTP {
+			a.storeActiveTerminal()
+			oldSess := a.sess
+			a.sess = msg.sess
+			a.activeHostKey = msg.key
+			a.ensureSessionMaps()
+			a.sessions[a.activeHostKey] = msg.sess
 			sm, err := newSFTPModel(a)
 			if err != nil {
+				a.sess = oldSess
+				if oldSess != nil && oldSess.Host != nil {
+					a.activeHostKey = a.keyForSession(oldSess)
+				}
+				_ = msg.sess.Close()
 				a.err = fmt.Sprintf("sftp: %v", err)
-				a.view = viewHostTree
 				return nil
 			}
 			a.sftp = sm
-			a.view = viewSFTP
+			a.activeSFTPKey = msg.key
+			a.status = fmt.Sprintf("connected to %s", msg.host.Name)
+			a.right = rightSFTP
+			a.focus = focusRight
 			return nil
 		}
-		a.terminal = newTerminalModel()
-		a.view = viewTerminal
-		return openTerminalCmd(a)
+		return openTerminalCmd(a, msg.sess, msg.key)
 	case msg.hke != nil:
-		a.hostKey = newHostKeyModel(msg.host, msg.hke)
+		a.hostKey = newHostKeyModel(msg.host, msg.hke, msg.key)
 		a.hostKey.openSFTPAfter = msg.forSFTP
 		a.view = viewHostKeyPrompt
 		a.status = ""
@@ -234,7 +254,6 @@ func (a *App) handleDialResult(msg dialResultMsg) tea.Cmd {
 	default:
 		a.err = fmt.Sprintf("connect: %v", msg.err)
 		a.status = ""
-		a.view = viewHostTree
 		return nil
 	}
 }
@@ -242,9 +261,13 @@ func (a *App) handleDialResult(msg dialResultMsg) tea.Cmd {
 func (m hostTreeModel) delete(app *App) (hostTreeModel, tea.Cmd) {
 	n := m.flat[m.cur]
 	if n.kind == nodeHost {
+		app.closeSessionKey(nodeConnKey(n.groupIdx, n.hostIdx))
 		g := &app.vault.Groups[n.groupIdx]
 		g.Hosts = append(g.Hosts[:n.hostIdx], g.Hosts[n.hostIdx+1:]...)
 	} else {
+		for hi := range app.vault.Groups[n.groupIdx].Hosts {
+			app.closeSessionKey(nodeConnKey(n.groupIdx, hi))
+		}
 		app.vault.Groups = append(app.vault.Groups[:n.groupIdx], app.vault.Groups[n.groupIdx+1:]...)
 	}
 	if err := vault.Save(app.opts.VaultPath, app.master, app.vault); err != nil {
@@ -256,45 +279,77 @@ func (m hostTreeModel) delete(app *App) (hostTreeModel, tea.Cmd) {
 
 // View renders the tree plus a help line.
 func (m hostTreeModel) View(app *App) string {
+	width, height := app.LeftSize()
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Hosts"))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 	if len(m.flat) == 0 {
-		b.WriteString(dimStyle.Render("No hosts yet. Press 'N' to add a group, 'n' to add a host."))
+		b.WriteString(dimStyle.Render(fitText("No hosts yet", width)))
 		b.WriteString("\n")
+		b.WriteString(dimStyle.Render(fitText("N group  n host", width)))
 	} else {
-		for i, n := range m.flat {
-			line := m.renderNode(app, n)
+		connected := app.connectedKeys()
+		start, end := m.visibleRange(height - 6)
+		for i := start; i < end; i++ {
+			n := m.flat[i]
 			if i == m.cur {
-				line = cursorStyle.Render("❯ ") + line
+				b.WriteString(cursorStyle.Render("❯ "))
 			} else {
-				line = "  " + line
+				b.WriteString("  ")
 			}
-			b.WriteString(line)
-			b.WriteString("\n")
+			m.renderNode(&b, app, n, width-2, connected)
 		}
 	}
-	help := dimStyle.Render("[Enter] connect/toggle  [s] SFTP  [e] edit  [n] host  [N] group  [x] delete  [space] collapse")
 	b.WriteString("\n")
-	b.WriteString(help)
+	b.WriteString(dimStyle.Render(fitText("[Enter] connect   [s] SFTP", width)))
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render(fitText("[e] edit   [n] host   [N] group", width)))
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render(fitText("[x] delete   [Space] collapse", width)))
 	return b.String()
 }
 
-func (m hostTreeModel) renderNode(app *App, n treeNode) string {
+func (m hostTreeModel) visibleRange(maxLines int) (int, int) {
+	if len(m.flat) == 0 {
+		return 0, 0
+	}
+	if maxLines < 1 {
+		maxLines = 1
+	}
+	start := 0
+	if m.cur >= maxLines {
+		start = m.cur - maxLines + 1
+	}
+	end := start + maxLines
+	if end > len(m.flat) {
+		end = len(m.flat)
+		start = end - maxLines
+		if start < 0 {
+			start = 0
+		}
+	}
+	return start, end
+}
+
+func (m hostTreeModel) renderNode(b *strings.Builder, app *App, n treeNode, width int, connected map[string]bool) {
 	if n.kind == nodeGroup {
 		g := app.vault.Groups[n.groupIdx]
 		marker := "▾"
 		if n.collapsed {
 			marker = "▸"
 		}
-		return groupStyle.Render(fmt.Sprintf("%s %s (%d)", marker, g.Name, len(g.Hosts)))
+		b.WriteString(groupStyle.Render(fitText(fmt.Sprintf("%s %s (%d)", marker, g.Name, len(g.Hosts)), width)))
+		b.WriteString("\n")
+		return
 	}
 	h := app.vault.Groups[n.groupIdx].Hosts[n.hostIdx]
-	auth := h.Auth.Type
-	if auth == "" {
-		auth = "?"
+	prefix := "  "
+	if connected[nodeConnKey(n.groupIdx, n.hostIdx)] {
+		prefix = connectedStyle.Render("● ")
 	}
-	return fmt.Sprintf("%-16s %s@%s:%d  [%s]", h.Name, h.User, h.Addr, portOr22(h.Port), auth)
+	b.WriteString(prefix)
+	b.WriteString(fitText(fmt.Sprintf("%s@%s:%d", h.User, h.Addr, portOr22(h.Port)), width-2))
+	b.WriteString("\n")
 }
 
 func portOr22(p int) int {
@@ -302,4 +357,32 @@ func portOr22(p int) int {
 		return 22
 	}
 	return p
+}
+
+func nodeConnKey(groupIdx, hostIdx int) string {
+	return fmt.Sprintf("node|%d|%d", groupIdx, hostIdx)
+}
+
+func fitText(s string, width int) string {
+	if width < 1 {
+		return ""
+	}
+	if runewidth.StringWidth(s) <= width {
+		return s
+	}
+	if width == 1 {
+		return "…"
+	}
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		rw := runewidth.RuneWidth(r)
+		if used+rw > width-1 {
+			break
+		}
+		b.WriteRune(r)
+		used += rw
+	}
+	b.WriteRune('…')
+	return b.String()
 }

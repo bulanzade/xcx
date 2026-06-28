@@ -29,6 +29,8 @@ type editModel struct {
 	heading string
 }
 
+const authFieldIndex = 4
+
 func newEditModel(app *App, kind editKind, groupIdx, hostIdx int) editModel {
 	m := editModel{kind: kind, groupIdx: groupIdx, hostIdx: hostIdx}
 	switch kind {
@@ -45,7 +47,7 @@ func newEditModel(app *App, kind editKind, groupIdx, hostIdx int) editModel {
 		addr := newField("address / host", "")
 		port := newField("port", "22")
 		user := newField("user", "")
-		authType := newField("auth (password|key)", "password")
+		authType := newField("auth", "password")
 		secret := newField("password", "")
 		keyPath := newField("key path", "")
 		passphrase := newField("key passphrase", "")
@@ -93,18 +95,35 @@ func (m editModel) Update(app *App, msg tea.Msg) (editModel, tea.Cmd) {
 			m.fields[m.cur].Blur()
 			m.cur = (m.cur - 1 + len(m.fields)) % len(m.fields)
 			m.fields[m.cur].Focus()
+		case "left", "right", " ":
+			if m.kind == editKindHost && m.cur == authFieldIndex {
+				m.toggleAuthType()
+				return m, nil
+			}
 		case "enter":
 			return m.save(app)
 		case "esc":
-			app.view = viewHostTree
+			app.view = viewMain
 			return m, nil
 		case "ctrl+c", "ctrl+q":
 			return m, tea.Quit
 		}
 	}
+	if m.kind == editKindHost && m.cur == authFieldIndex {
+		return m, nil
+	}
 	var cmd tea.Cmd
 	*m.fields[m.cur], cmd = m.fields[m.cur].Update(msg)
 	return m, cmd
+}
+
+func (m editModel) toggleAuthType() {
+	cur := strings.TrimSpace(m.fields[authFieldIndex].Value())
+	if cur == "key" {
+		m.fields[authFieldIndex].SetValue("password")
+		return
+	}
+	m.fields[authFieldIndex].SetValue("key")
 }
 
 func (m editModel) save(app *App) (editModel, tea.Cmd) {
@@ -151,7 +170,7 @@ func (m editModel) save(app *App) (editModel, tea.Cmd) {
 		app.err = fmt.Sprintf("save: %v", err)
 	}
 	app.hostTree.rebuild(app)
-	app.view = viewHostTree
+	app.view = viewMain
 	return m, nil
 }
 
@@ -166,9 +185,20 @@ func (m editModel) View(app *App) string {
 		} else {
 			b.WriteString("  ")
 		}
-		b.WriteString(fmt.Sprintf("%-14s %s\n", label+":", f.View()))
+		value := f.View()
+		if m.kind == editKindHost && i == authFieldIndex {
+			value = authChoiceView(f.Value())
+		}
+		b.WriteString(fmt.Sprintf("%-14s %s\n", label+":", value))
 	}
 	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("[Tab] next  [Enter] save  [Esc] cancel"))
+	b.WriteString(dimStyle.Render("[Tab] next  [←/→/Space] choose auth  [Enter] save  [Esc] cancel"))
 	return b.String()
+}
+
+func authChoiceView(value string) string {
+	if strings.TrimSpace(value) == "key" {
+		return dimStyle.Render("password") + "  " + cursorStyle.Render("[key]")
+	}
+	return cursorStyle.Render("[password]") + "  " + dimStyle.Render("key")
 }

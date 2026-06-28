@@ -134,6 +134,19 @@ type Runner func(src, dst string, prog func(done, total int64)) (int64, error)
 // sent once per job when it finishes. Both channels are optional (nil-safe).
 // Run drains the queue: finished jobs are removed as they complete.
 func (q *Queue) Run(ctx context.Context, run Runner, progress chan<- Progress, completed chan<- Completed) error {
+	q.mu.Lock()
+	if q.running {
+		q.mu.Unlock()
+		return nil
+	}
+	q.running = true
+	q.mu.Unlock()
+	defer func() {
+		q.mu.Lock()
+		q.running = false
+		q.mu.Unlock()
+	}()
+
 	for {
 		if ctx != nil {
 			select {

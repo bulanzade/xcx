@@ -32,8 +32,8 @@ func TestUnlock_VaultCreationSetsVerifier(t *testing.T) {
 	app.unlock, _ = app.unlock.Update(app, typeKeys("masterpw"))
 	app.unlock, _ = app.unlock.Update(app, enterKey)
 
-	if app.view != viewHostTree {
-		t.Fatalf("expected viewHostTree after creation, got %v", app.view)
+	if app.view != viewMain {
+		t.Fatalf("expected viewMain after creation, got %v", app.view)
 	}
 	if app.verifier == nil {
 		t.Fatal("verifier is nil after vault creation — connect will fail")
@@ -66,8 +66,8 @@ func TestUnlock_ExistingVaultSetsVerifier(t *testing.T) {
 	app2.unlock, _ = app2.unlock.Update(app2, typeKeys("masterpw"))
 	app2.unlock, _ = app2.unlock.Update(app2, enterKey)
 
-	if app2.view != viewHostTree {
-		t.Fatalf("expected viewHostTree after unlock, got %v", app2.view)
+	if app2.view != viewMain {
+		t.Fatalf("expected viewMain after unlock, got %v", app2.view)
 	}
 	if app2.verifier == nil {
 		t.Fatal("verifier is nil after unlock — connect will fail")

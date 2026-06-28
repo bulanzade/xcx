@@ -14,13 +14,14 @@ import (
 type hostKeyModel struct {
 	host *vault.Host
 	err  *session.HostKeyError
+	key  string
 	// openSFTPAfter, when true, routes a successful connect to the SFTP view
 	// instead of the terminal view (set by the caller that initiated SFTP).
 	openSFTPAfter bool
 }
 
-func newHostKeyModel(host *vault.Host, err *session.HostKeyError) hostKeyModel {
-	return hostKeyModel{host: host, err: err}
+func newHostKeyModel(host *vault.Host, err *session.HostKeyError, key string) hostKeyModel {
+	return hostKeyModel{host: host, err: err, key: key}
 }
 
 func (m hostKeyModel) Update(app *App, msg tea.Msg) (hostKeyModel, tea.Cmd) {
@@ -33,12 +34,12 @@ func (m hostKeyModel) Update(app *App, msg tea.Msg) (hostKeyModel, tea.Cmd) {
 		// Only unknown hosts are confirmable; mismatches must never be trusted.
 		if !m.err.Unknown {
 			app.err = "host key mismatch — refusing to connect"
-			app.view = viewHostTree
+			app.view = viewMain
 			return m, nil
 		}
 		return m.connectTrusted(app)
 	case "n", "esc":
-		app.view = viewHostTree
+		app.view = viewMain
 		app.status = "connection cancelled"
 		return m, nil
 	case "ctrl+c", "ctrl+q":
@@ -60,12 +61,12 @@ func (m hostKeyModel) connectTrusted(app *App) (hostKeyModel, tea.Cmd) {
 		sess, err := session.Connect(host, session.DialOptions{Verifier: trusted})
 		switch {
 		case err == nil:
-			return dialResultMsg{host: host, sess: sess, forSFTP: m.openSFTPAfter}
+			return dialResultMsg{host: host, key: m.key, sess: sess, forSFTP: m.openSFTPAfter}
 		default:
 			if hke, ok := session.IsHostKeyError(err); ok {
-				return dialResultMsg{host: host, hke: hke, forSFTP: m.openSFTPAfter}
+				return dialResultMsg{host: host, key: m.key, hke: hke, forSFTP: m.openSFTPAfter}
 			}
-			return dialResultMsg{host: host, err: err, forSFTP: m.openSFTPAfter}
+			return dialResultMsg{host: host, key: m.key, err: err, forSFTP: m.openSFTPAfter}
 		}
 	}
 }

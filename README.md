@@ -1,21 +1,22 @@
 # xcx — TUI SSH 连接管理工具
 
-一个终端(TUI)SSH 连接管理器,带内嵌交互式终端和双面板 SFTP 文件管理器。主机配置以 AES-256-GCM 加密保存,用主密码解锁。
+一个终端(TUI)SSH 连接管理器,左侧常驻主机树,右侧显示终端/SFTP/占位面板。主机配置以 AES-256-GCM 加密保存,用主密码解锁。
 
 ## 特性(MVP)
 
 - 🔐 **加密配置** — 主机信息存于 `vault.bin`,AES-256-GCM 加密,主密码经 Argon2id 派生密钥
-- 🌲 **分组式主机树** — 折叠/展开分组,快速检索连接
-- 🖥️ **内嵌交互式终端** — 在 TUI 内直接打开 SSH shell(自研 xterm 状态机),`Ctrl+\` 退出
-- 📁 **双面板 SFTP** — Midnight Commander 风格,本地↔远程,多选批量传输
-- 📊 **传输队列** — 后台顺序执行,状态栏实时显示进度/队列深度
+- 🌲 **常驻主机树** — 左侧固定显示分组主机,已连接主机会显示绿色标记
+- 🧭 **分屏工作区** — 右侧在占位、终端、SFTP 之间切换,左侧主机树保持可见
+- 🖥️ **内嵌交互式终端** — 在 TUI 内直接打开 SSH shell(自研 xterm 状态机),支持后台保留多个连接
+- 📁 **双面板 SFTP** — Midnight Commander 风格,本地↔远程,多选批量传输;本地面板默认当前工作目录
+- 📊 **传输队列** — 后台顺序执行,状态栏实时显示进度、速度和队列深度
 - 🔑 **主机指纹校验** — 首次连接交互式询问信任,记录到 `known_hosts`
-- 认证支持:**密码** 与 **SSH 密钥(含 passphrase)**
+- 认证支持:**密码** 与 **SSH 密钥(含 passphrase)**;编辑主机时通过选择项切换认证类型
 
 ## 构建 & 运行
 
 ```bash
-# 构建(需 Go 1.21+)
+# 构建(需 Go 1.25+)
 go build -o xcx .
 
 # 运行(进入全屏 TUI)
@@ -40,7 +41,7 @@ go test -v ./... | grep -c PASS
 | 键 | 动作 |
 |---|---|
 | `↑`/`↓` 或 `k`/`j` | 移动选择 |
-| `Enter` | 连接(主机)/ 折叠(分组) |
+| `Enter` | 连接/恢复主机终端;在分组上折叠/展开 |
 | `Space` | 折叠/展开分组 |
 | `s` | 打开 SFTP |
 | `e` | 编辑主机 |
@@ -52,37 +53,51 @@ go test -v ./... | grep -c PASS
 | 键 | 动作 |
 |---|---|
 | (任意键) | 发送到远端 PTY |
-| `Ctrl+\` | 退出终端,回到主机树 |
+| `Tab` | 发送到远端 shell(用于命令补全) |
+| `Shift+Tab` | 焦点切回主机树 |
+| `Ctrl+S` | 打开当前连接的 SFTP 面板 |
+| `Ctrl+\` | 断开当前终端连接 |
 
 ### SFTP 双面板
 | 键 | 动作 |
 |---|---|
-| `Tab` | 切换左右面板焦点 |
+| `Tab` | 在主机树、本地面板、远程面板之间循环 |
 | `Enter` | 进入目录 |
 | `Backspace`/`h` | 返回上级 |
 | `Space` | 多选当前文件 |
 | `F5` | 复制到对侧(下载/上传) |
+| `F6` | 复制到对侧(下载/上传) |
 | `F7` | 新建目录 |
 | `F8`/`Del` | 删除 |
 | `r` | 刷新 |
-| `Esc` | 返回主机树 |
+| `Esc` | 返回终端(若存在),否则返回右侧占位面板 |
+
+### 编辑主机
+| 键 | 动作 |
+|---|---|
+| `Tab`/`↓` | 下一个字段 |
+| `Shift+Tab`/`↑` | 上一个字段 |
+| `←`/`→`/`Space` | 在 `auth` 字段切换 `password`/`key` |
+| `Enter` | 保存 |
+| `Esc` | 取消 |
 
 ### 全局
 | 键 | 动作 |
 |---|---|
-| `Ctrl+Q` / `Ctrl+C` | 退出 |
+| `Ctrl+Q` / `Ctrl+C` | 在非终端焦点下退出并关闭所有后台 SSH/SFTP/终端连接 |
 
 ## 架构
 
 ```
 Bubble Tea (alt-screen)
-  ├─ Host Tree View        (internal/ui/hosttree.go)
-  ├─ Terminal View         (internal/ui/terminal_view.go)
-  ├─ SFTP Dual-Pane View   (internal/ui/sftp_view.go)
-  └─ Unlock/Edit/HostKey   (internal/ui/{unlock,edit,hostkey}.go)
+  ├─ Main Split View       left: host tree | right: terminal/SFTP/placeholder
+  ├─ Host Tree             (internal/ui/hosttree.go)
+  ├─ Terminal Pane         (internal/ui/terminal_view.go)
+  ├─ SFTP Dual-Pane        (internal/ui/sftp_view.go)
+  └─ Unlock/Edit/HostKey   modal views (internal/ui/{unlock,edit,hostkey}.go)
         │
         ▼
-Session Manager            (internal/session)  — 认证 + known_hosts
+Session Manager + UI cache  (internal/session + internal/ui) — 多后台连接 + known_hosts
         │
   ┌─────┴──────┬────────────┬──────────────┐
   │ vault      │ sshterm    │ sftp         │ transfer
@@ -98,4 +113,4 @@ Session Manager            (internal/session)  — 认证 + known_hosts
 - `internal/sshterm` — 内嵌终端:PTY 驱动 + 轻量 xterm 状态机(Screen + Parser)
 - `internal/sftp` — `Backend` 接口,本地(os)与远程(pkg/sftp)对称实现 + `Copy` 原语
 - `internal/transfer` — 顺序传输队列,进度节流 + 失败重试
-- `internal/ui` — Bubble Tea 视图层与全局路由
+- `internal/ui` — Bubble Tea 视图层、分屏路由、后台连接缓存与生命周期清理

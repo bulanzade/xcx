@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -77,17 +78,9 @@ type sftpModel struct {
 }
 
 func newSFTPModel(app *App) (sftpModel, error) {
-	home, _ := os.UserHomeDir()
-	if home == "" {
-		home = "."
-	}
-	localPane := &pane{
-		backend:  sftp.NewLocalBackend(),
-		cwd:      home,
-		selected: map[string]bool{},
-	}
-	if err := localPane.refresh(); err != nil {
-		return sftpModel{}, fmt.Errorf("list home: %w", err)
+	localPane, err := newLocalSFTPPane()
+	if err != nil {
+		return sftpModel{}, err
 	}
 	rb, err := sftp.NewRemoteBackend(app.sess.Client())
 	if err != nil {
@@ -105,6 +98,22 @@ func newSFTPModel(app *App) (sftpModel, error) {
 	return sftpModel{local: localPane, remote: remotePane, focused: localPane, remoteBk: rb}, nil
 }
 
+func newLocalSFTPPane() (*pane, error) {
+	cwd, err := os.Getwd()
+	if err != nil || cwd == "" {
+		cwd = "."
+	}
+	localPane := &pane{
+		backend:  sftp.NewLocalBackend(),
+		cwd:      cwd,
+		selected: map[string]bool{},
+	}
+	if err := localPane.refresh(); err != nil {
+		return nil, fmt.Errorf("list cwd: %w", err)
+	}
+	return localPane, nil
+}
+
 // close releases the SFTP subsystem.
 func (m *sftpModel) close() {
 	if m.remoteBk != nil {
@@ -117,44 +126,51 @@ func (m sftpModel) Update(app *App, msg tea.Msg) (sftpModel, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
-	switch k.String() {
-	case "tab":
+	switch {
+	case k.Type == tea.KeyTab:
 		if m.focused == m.local {
 			m.focused = m.remote
 		} else {
 			m.focused = m.local
 		}
-	case "up", "k":
+	case k.String() == "up", k.String() == "k":
 		if m.focused.cur > 0 {
 			m.focused.cur--
 		}
-	case "down", "j":
+	case k.String() == "down", k.String() == "j":
 		if m.focused.cur < len(m.focused.entries)-1 {
 			m.focused.cur++
 		}
-	case "enter":
+	case k.String() == "enter":
 		m.enterDir()
-	case "backspace", "h":
+	case k.String() == "backspace", k.String() == "h":
 		m.goUp()
-	case " ":
+	case k.String() == " ":
 		m.focused.toggleSelect()
 		if m.focused.cur < len(m.focused.entries)-1 {
 			m.focused.cur++
 		}
-	case "r":
+	case k.String() == "r":
 		_ = m.focused.refresh()
-	case "F5":
-		m.transfer(app, true) // download when remote focused, else upload
-	case "F6":
-		m.transfer(app, false)
-	case "F7":
+	case k.Type == tea.KeyF5:
+		m.transfer(app)
+	case k.Type == tea.KeyF6:
+		m.transfer(app)
+	case k.Type == tea.KeyF7:
 		m.mkdir()
-	case "F8", "delete":
+	case k.Type == tea.KeyF8, k.String() == "delete":
 		m.remove()
-	case "esc":
+	case k.String() == "esc":
 		m.close()
-		app.view = viewHostTree
-	case "ctrl+c", "ctrl+q":
+		app.activeSFTPKey = ""
+		if app.terminal.term != nil {
+			app.right = rightTerminal
+			app.focus = focusRight
+		} else {
+			app.right = rightPlaceholder
+			app.focus = focusLeft
+		}
+	case k.String() == "ctrl+c", k.String() == "ctrl+q":
 		return m, tea.Quit
 	}
 	return m, nil
@@ -202,7 +218,7 @@ func (m *sftpModel) remove() {
 
 // transfer enqueues jobs for the selected entries from the focused pane to the
 // other pane and runs them via the app's transfer queue.
-func (m *sftpModel) transfer(app *App, _ bool) {
+func (m *sftpModel) transfer(app *App) {
 	src := m.focused
 	var dst *pane
 	if src == m.local {
@@ -243,8 +259,34 @@ func (m *sftpModel) transfer(app *App, _ bool) {
 	run := func(srcPath, dstPath string, prog func(done, total int64)) (int64, error) {
 		return sftp.Copy(srcBk, dstBk, srcPath, dstPath, prog)
 	}
+	progress := make(chan transfer.Progress, 16)
+	completed := make(chan transfer.Completed, 16)
+	// Run the queue and consume its progress on separate goroutines. Run sends
+	// progress synchronously while copying, so the consumer must stay active to
+	// keep large transfers from blocking on a full channel.
 	go func() {
-		_ = app.queue.Run(context.Background(), run, nil, nil)
+		started := time.Now()
+		for progress != nil || completed != nil {
+			select {
+			case p, ok := <-progress:
+				if !ok {
+					progress = nil
+					continue
+				}
+				app.updateTransferProgress(p, started)
+			case c, ok := <-completed:
+				if !ok {
+					completed = nil
+					continue
+				}
+				app.finishTransfer(c)
+			}
+		}
+	}()
+	go func() {
+		_ = app.queue.Run(context.Background(), run, progress, completed)
+		close(progress)
+		close(completed)
 		_ = src.refresh()
 		_ = dst.refresh()
 	}()
@@ -253,15 +295,16 @@ func (m *sftpModel) transfer(app *App, _ bool) {
 
 // View renders the two panes side by side.
 func (m sftpModel) View(app *App) string {
-	w, h := app.Size()
+	w, h := app.RightSize()
 	paneW := (w - 3) / 2 // 3 for the gap and borders
 	if paneW < 20 {
 		paneW = 20
 	}
 	bodyH := h - 3 // room for header + footer
 
-	left := m.renderPane(m.local, m.focused == m.local, paneW, bodyH, "Local")
-	right := m.renderPane(m.remote, m.focused == m.remote, paneW, bodyH, "Remote")
+	rightFocused := app.focus == focusRight
+	left := m.renderPane(m.local, rightFocused && m.focused == m.local, paneW, bodyH, "Local")
+	right := m.renderPane(m.remote, rightFocused && m.focused == m.remote, paneW, bodyH, "Remote")
 	row := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 
 	footer := dimStyle.Render("[Tab] switch  [Enter] open  [Backspace] up  [Space] select  [F5] copy  [F7] mkdir  [F8] del  [r] refresh  [Esc] back")
@@ -285,10 +328,9 @@ func (m sftpModel) renderPane(p *pane, active bool, width, height int, label str
 	b.WriteString("\n")
 
 	rows := height - 2 // header + cwd lines
-	for i, e := range p.entries {
-		if i >= rows {
-			break
-		}
+	start, end := visibleEntryRange(len(p.entries), p.cur, rows)
+	for i := start; i < end; i++ {
+		e := p.entries[i]
 		marker := " "
 		if p.selected[e.Name] {
 			marker = "●"
@@ -310,6 +352,31 @@ func (m sftpModel) renderPane(p *pane, active bool, width, height int, label str
 		b.WriteString("\n")
 	}
 	return style.Width(width).Height(height).Render(strings.TrimRight(b.String(), "\n"))
+}
+
+func visibleEntryRange(total, cur, rows int) (int, int) {
+	if total <= 0 || rows <= 0 {
+		return 0, 0
+	}
+	if cur < 0 {
+		cur = 0
+	}
+	if cur >= total {
+		cur = total - 1
+	}
+	start := 0
+	if cur >= rows {
+		start = cur - rows + 1
+	}
+	end := start + rows
+	if end > total {
+		end = total
+		start = end - rows
+		if start < 0 {
+			start = 0
+		}
+	}
+	return start, end
 }
 
 // joinPath joins dir + name, preserving the path style of dir. The remote pane

@@ -47,7 +47,9 @@ func (app *App) enterHostTree() {
 		app.verifier = &session.HostKeyVerifier{DB: session.NewFileHostKeyDB(app.opts.KnownHostsPath)}
 	}
 	app.hostTree = newHostTreeModel(app)
-	app.view = viewHostTree
+	app.view = viewMain
+	app.right = rightPlaceholder
+	app.focus = focusLeft
 }
 
 // detectedNoVault reports whether the configured vault file is absent.
