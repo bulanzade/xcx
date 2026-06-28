@@ -15,9 +15,11 @@
 
 ## 安装
 
-### 一键安装 / 升级
+### 手动安装
 
-从 [Releases](https://github.com/bulanzade/xcx/releases) 下载对应平台的最新构建并安装。安装脚本会自动识别平台、按需升级(对比当前版本与最新 tag,已是最新则跳过),并在安装前备份旧二进制以便回滚。
+从 [Releases](https://github.com/bulanzade/xcx/releases) 下载对应平台的最新构建并安装。
+
+### 一键安装 / 升级
 
 **Linux / macOS**(装到 `~/.local/bin`,root 用户装到 `/usr/local/bin`):
 
@@ -31,8 +33,6 @@ curl -fsSL https://raw.githubusercontent.com/bulanzade/xcx/main/install.sh | sh
 iwr -useb https://raw.githubusercontent.com/bulanzade/xcx/main/install.ps1 | iex
 ```
 
-> Windows 安装脚本会把安装目录加入**当前 PowerShell 会话**的 PATH;永久加入用户级 PATH 按脚本末尾提示执行 `SetEnvironmentVariable`,或重开终端。
-
 ### 升级 / 强制重装
 
 重新运行上面的安装命令即可升级。已是最新版本会自动跳过;强制重装(忽略版本对比):
@@ -41,7 +41,7 @@ iwr -useb https://raw.githubusercontent.com/bulanzade/xcx/main/install.ps1 | iex
 # Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/bulanzade/xcx/main/install.sh | sh -s -- --force
 # Windows
-./install.ps1 -Force
+& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/bulanzade/xcx/main/install.ps1).Content)) -Force
 ```
 
 ### 卸载
@@ -52,7 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/bulanzade/xcx/main/install.sh | sh 
 # Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/bulanzade/xcx/main/install.sh | sh -s -- --uninstall
 # Windows
-./install.ps1 -Uninstall
+& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/bulanzade/xcx/main/install.ps1).Content)) -Uninstall
 ```
 
 ### 版本查看
