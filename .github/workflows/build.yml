@@ -1,0 +1,131 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build binary (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            archive: zip
+          - goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine binary name
+        id: name
+        run: |
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            echo "bin=xcx.exe" >> "$GITHUB_OUTPUT"
+            echo "platform=windows-${{ matrix.goarch }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "bin=xcx" >> "$GITHUB_OUTPUT"
+            echo "platform=xcx-${{ matrix.goos }}-${{ matrix.goarch }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w" -o "dist/${{ steps.name.outputs.bin }}" .
+
+      - name: Archive
+        id: archive
+        run: |
+          cd dist
+          ARTIFACT="${{ steps.name.outputs.platform }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -X "${ARTIFACT}.zip" "${{ steps.name.outputs.bin }}"
+            echo "file=${ARTIFACT}.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "${ARTIFACT}.tar.gz" "${{ steps.name.outputs.bin }}"
+            echo "file=${ARTIFACT}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ steps.archive.outputs.file }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    # only on tag pushes — manual `workflow_dispatch` skips the release step
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7.0.1
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: |
+          find assets -type f | sort
+          echo "---"
+          find assets -type f -name "*.tar.gz" -o -type f -name "*.zip" | tr '\n' ' ' | sed 's/ $//'
+
+      - name: Generate release notes from commits
+        id: release_notes
+        run: |
+          CURRENT_TAG="${GITHUB_REF#refs/tags/}"
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || true)
+          if [ -n "$PREVIOUS_TAG" ]; then
+            RANGE="${PREVIOUS_TAG}..${CURRENT_TAG}"
+          else
+            RANGE="${CURRENT_TAG}"
+          fi
+          git log "$RANGE" --no-merges --pretty=format:"- %s" > release_notes.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3.0.1
+        with:
+          files: |
+            assets/*.tar.gz
+            assets/*.zip
+          body_path: release_notes.md
