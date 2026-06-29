@@ -151,6 +151,45 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 		case tea.KeyCtrlS:
 			app.openSFTPFromTerminal()
 			return m, nil
+		case tea.KeyShiftUp:
+			m.scroll(1)
+			return m, nil
+		case tea.KeyShiftDown:
+			m.scroll(-1)
+			return m, nil
+		case tea.KeyPgUp, tea.KeyPgDown:
+			// Always page through local scrollback. We deliberately do NOT
+			// forward PgUp/PgDn to the remote shell: bash readline binds them
+			// to history search, so forwarding made the command line flip
+			// between history entries instead of scrolling — the opposite of
+			// what the user expects. Full-screen apps (less/vim/man) don't
+			// rely on these under our local terminal.
+			_, h := app.RightSize()
+			delta := h
+			if msg.Type == tea.KeyPgDown {
+				delta = -h
+			}
+			m.scroll(delta)
+			return m, nil
+		}
+		// g / G jump to the top / bottom of scrollback (vim-style), but ONLY
+		// while reviewing history — in live mode they must reach the shell so
+		// the user can still type them (git, go build, …). We use these
+		// instead of Ctrl+PgUp/PgDn because bubbletea's Windows console-input
+		// layer cannot distinguish those from plain PgUp/PgDn (VK_PRIOR/
+		// VK_NEXT map to KeyPgUp/KeyPgDown with no modifier), so the Ctrl
+		// variants never arrived on Windows.
+		if msg.Type == tea.KeyRunes && m.scrolledBack() {
+			if len(msg.Runes) == 1 {
+				switch msg.Runes[0] {
+				case 'g':
+					m.jumpTop()
+					return m, nil
+				case 'G':
+					m.jumpBottom()
+					return m, nil
+				}
+			}
 		}
 		if err := m.write(encodeKey(msg)); err != nil {
 			app.err = fmt.Sprintf("write: %v", err)
@@ -165,6 +204,36 @@ func (m terminalModel) write(input []byte) error {
 		return m.writeInput(input)
 	}
 	return m.term.WriteInput(input)
+}
+
+// scroll moves the terminal view by delta rows (positive = up into history).
+// Only meaningful when a real terminal is attached; for the writeInput path
+// (no screen) it's a no-op.
+func (m terminalModel) scroll(delta int) {
+	if m.term != nil {
+		m.term.Scroll(delta)
+	}
+}
+
+// scrolledBack reports whether the user is currently reviewing scrollback
+// history (the view offset is above the live bottom). Used to decide whether
+// to intercept g/G for jumping or let them reach the shell.
+func (m terminalModel) scrolledBack() bool {
+	return m.term != nil && m.term.Screen().ScrollOffset() > 0
+}
+
+// jumpTop scrolls the view to the very top of scrollback.
+func (m terminalModel) jumpTop() {
+	if m.term != nil {
+		m.term.Scroll(1 << 20) // clamped by the screen to scrollMax()
+	}
+}
+
+// jumpBottom returns the view to live (bottom) output.
+func (m terminalModel) jumpBottom() {
+	if m.term != nil {
+		m.term.Screen().ResetScroll()
+	}
 }
 
 func (m terminalModel) available() bool {

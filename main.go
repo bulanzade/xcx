@@ -50,6 +50,13 @@ func main() {
 		KnownHostsPath: filepath.Join(dir, "known_hosts"),
 	})
 
+	// NOTE: mouse reporting (WithMouseCellMotion) is intentionally NOT enabled.
+	// It conflicts with the host terminal's native text selection/copy: on
+	// Windows Terminal it blocks selection entirely (the console mouse API is
+	// exclusive), and on GNOME Terminal multi-line selection also grabs the
+	// pane borders. Mouse-wheel scrolling is handled by the host terminal's
+	// own scrollback instead, and in-app history review uses the keyboard
+	// (Shift+arrows, PgUp/PgDn, g/G).
 	p := tea.NewProgram(app, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "xcx: %v\n", err)

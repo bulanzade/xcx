@@ -2,17 +2,6 @@
 
 一个终端(TUI)SSH 连接管理器,左侧常驻主机树,右侧显示终端/SFTP/占位面板。主机配置以 AES-256-GCM 加密保存,用主密码解锁。
 
-## 特性(MVP)
-
-- 🔐 **加密配置** — 主机信息存于 `vault.bin`,AES-256-GCM 加密,主密码经 Argon2id 派生密钥
-- 🌲 **常驻主机树** — 左侧固定显示分组主机,已连接主机会显示绿色标记
-- 🧭 **分屏工作区** — 右侧在占位、终端、SFTP 之间切换,左侧主机树保持可见
-- 🖥️ **内嵌交互式终端** — 在 TUI 内直接打开 SSH shell(自研 xterm 状态机),支持后台保留多个连接
-- 📁 **双面板 SFTP** — Midnight Commander 风格,本地↔远程,多选批量传输;本地面板默认当前工作目录
-- 📊 **传输队列** — 后台顺序执行,状态栏实时显示进度、速度和队列深度
-- 🔑 **主机指纹校验** — 首次连接交互式询问信任,记录到 `known_hosts`
-- 认证支持:**密码** 与 **SSH 密钥(含 passphrase)**;编辑主机时通过选择项切换认证类型
-
 ## 安装
 
 ### 手动安装
@@ -133,32 +122,3 @@ go test -v ./... | grep -c PASS
 | 键 | 动作 |
 |---|---|
 | `Ctrl+Q` / `Ctrl+C` | 在非终端焦点下退出并关闭所有后台 SSH/SFTP/终端连接 |
-
-## 架构
-
-```
-Bubble Tea (alt-screen)
-  ├─ Main Split View       left: host tree | right: terminal/SFTP/placeholder
-  ├─ Host Tree             (internal/ui/hosttree.go)
-  ├─ Terminal Pane         (internal/ui/terminal_view.go)
-  ├─ SFTP Dual-Pane        (internal/ui/sftp_view.go)
-  └─ Unlock/Edit/HostKey   modal views (internal/ui/{unlock,edit,hostkey}.go)
-        │
-        ▼
-Session Manager + UI cache  (internal/session + internal/ui) — 多后台连接 + known_hosts
-        │
-  ┌─────┴──────┬────────────┬──────────────┐
-  │ vault      │ sshterm    │ sftp         │ transfer
-  │ (AES-GCM)  │ (PTY+xterm)│ (Backend)    │ (Queue)
-  └────────────┴────────────┴──────────────┘
-```
-
-**核心原则**: UI 层只发命令、收消息;所有网络/磁盘 I/O 在后台 goroutine 执行,通过 `tea.Cmd` + `tea.Msg` 通信,UI 永不阻塞。
-
-### 包职责
-- `internal/vault` — 加密配置存储(AES-256-GCM + Argon2id)
-- `internal/session` — SSH 连接、认证(password/key)、主机指纹校验
-- `internal/sshterm` — 内嵌终端:PTY 驱动 + 轻量 xterm 状态机(Screen + Parser)
-- `internal/sftp` — `Backend` 接口,本地(os)与远程(pkg/sftp)对称实现 + `Copy` 原语
-- `internal/transfer` — 顺序传输队列,进度节流 + 失败重试
-- `internal/ui` — Bubble Tea 视图层、分屏路由、后台连接缓存与生命周期清理

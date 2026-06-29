@@ -117,6 +117,20 @@ func (t *Terminal) Start(ctx context.Context) {
 // concurrently with the running read loop.
 func (t *Terminal) Screen() *Screen { return t.screen }
 
+// NewTerminalWithScreen builds a Terminal that has no live PTY but owns the
+// given Screen. It is intended for tests that exercise the Screen-backed
+// helpers (Scroll, View, rendering) without standing up a real SSH session.
+// The read loop is not started.
+func NewTerminalWithScreen(screen *Screen) *Terminal {
+	return &Terminal{screen: screen}
+}
+
+// Scroll moves the terminal view by delta rows within scrollback (positive =
+// up into history, negative = back toward live output). The offset is clamped
+// by the screen. The scroll is automatically cancelled when new remote output
+// arrives, so the view returns to live output.
+func (t *Terminal) Scroll(delta int) { t.screen.Scroll(delta) }
+
 // Width/Height report the current PTY dimensions.
 func (t *Terminal) Width() int  { t.mu.Lock(); defer t.mu.Unlock(); return t.width }
 func (t *Terminal) Height() int { t.mu.Lock(); defer t.mu.Unlock(); return t.height }
@@ -174,11 +188,13 @@ func (t *Terminal) readLoop(ctx context.Context) {
 		}
 		n, err := out.Read(buf)
 		if n > 0 {
-			// Parse under the screen's lock by treating the Screen's row slice
-			// mutations as sequential: the read loop is the sole writer, the UI
-			// only reads, so no extra lock is needed for correctness of the
-			// pointers; transient torn reads of a row are acceptable since the
-			// UI re-renders at its own frame rate.
+			// Parse under the screen's row slice mutations as sequential: the
+			// read loop is the sole writer, the UI only reads, so no extra lock
+			// is needed for correctness of the pointers; transient torn reads
+			// of a row are acceptable since the UI re-renders at its own frame
+			// rate. New output also cancels any scroll-back so the view jumps
+			// back to live (bottom) output, mirroring real terminals.
+			t.screen.ResetScroll()
 			t.parser.Write(buf[:n])
 		}
 		if err != nil {

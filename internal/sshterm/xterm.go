@@ -20,6 +20,18 @@ type Screen struct {
 	// autowrap tracking: when the cursor is placed one past the last column by
 	// a write, the next printable char wraps. We model the "pending wrap" flag.
 	pendingWrap bool
+
+	// scrollOff is how many rows above the live bottom edge the view is
+	// scrolled back: 0 = anchored to live output, n = show n rows further up
+	// into scrollback. Reset to 0 by ResetScroll / ScrollReset on new output.
+	// The UI sets this via Scroll when the user reviews history.
+	scrollOff int
+
+	// viewH is the height last passed to View/CursorInView. ScrollTo uses it as
+	// the clamp ceiling so the offset can't drift into a "dead zone" above the
+	// topmost reachable row. 0 until the first render; ScrollTo falls back to a
+	// looser ceiling in that case.
+	viewH int
 }
 
 // Cell is one screen position: a rune plus SGR style bits.
@@ -57,35 +69,102 @@ func (s *Screen) Cols() int { return s.cols }
 // Rows returns the total number of rows in scrollback (may exceed height).
 func (s *Screen) Rows() int { return len(s.rows) }
 
-// View returns the bottom `height` rows as a ready-to-render snapshot. If
-// there are fewer rows than height, the leading rows are empty.
+// View returns the `height` rows currently in view as a ready-to-render
+// snapshot. With no scroll offset it shows the bottom (live) `height` rows;
+// with a positive scroll offset (set by Scroll) the window moves up into the
+// scrollback. If there are fewer rows than height, the leading rows are empty.
+//
+// View also remembers the rendering height as the clamp ceiling for the scroll
+// offset (see ScrollTo), so the offset can never accumulate in a "dead zone"
+// past the topmost reachable row.
 func (s *Screen) View(height int) [][]Cell {
+	s.viewH = height
 	total := len(s.rows)
 	if height >= total {
 		return s.rows
 	}
-	return s.rows[total-height:]
+	// Live (offset 0): bottom-anchored window rows[total-height:].
+	// Scrolled back (offset n): shift the window up by n -> rows[total-height-n : total-n].
+	end := total - s.scrollOff
+	if end < height {
+		end = height
+	}
+	start := end - height
+	return s.rows[start:end]
 }
 
 // Cursor returns the current (row, col) cursor position.
 func (s *Screen) Cursor() (int, int) { return s.curRow, s.curCol }
 
 // CursorInView returns the cursor's (row, col) translated into the coordinate
-// space of View(height) — i.e. row is the index within the bottom `height`
-// rows, col is unchanged. It returns (-1, -1) when the cursor is above the
-// visible window (in scrolled-back content). Used by the renderer to draw the
-// cursor block on the right cell.
+// space of View(height) — i.e. row is the index within the visible window, col
+// is unchanged. It returns (-1, -1) when the cursor is outside the visible
+// window: either scrolled back above it, or below it. Used by the renderer to
+// draw the cursor block on the right cell.
 func (s *Screen) CursorInView(height int) (int, int) {
+	s.viewH = height
 	total := len(s.rows)
 	if height >= total {
 		return s.curRow, s.curCol
 	}
-	top := total - height
-	if s.curRow < top {
+	// The visible window covers absolute rows [start, end).
+	end := total - s.scrollOff
+	start := end - height
+	if s.curRow < start || s.curRow >= end {
 		return -1, -1
 	}
-	return s.curRow - top, s.curCol
+	return s.curRow - start, s.curCol
 }
+
+// ScrollOffset returns how many rows above the live bottom the view is scrolled
+// back (0 = live output).
+func (s *Screen) ScrollOffset() int { return s.scrollOff }
+
+// Scroll moves the view by delta rows (positive = further up into scrollback,
+// negative = back toward live output). The offset is clamped by ScrollTo to the
+// reachable range so it can't accumulate past the topmost visible row.
+func (s *Screen) Scroll(delta int) {
+	s.ScrollTo(s.scrollOff + delta)
+}
+
+// ScrollTo sets the absolute scroll offset (rows above the live bottom). It is
+// clamped to [0, total-viewH]: scrolling further than that would run the
+// viewport past the top of the buffer, and clamping there (rather than at
+// total-1) avoids a "dead zone" where offsets between total-viewH and total-1
+// all render the same top-anchored view — without this, the user could scroll
+// up into that invisible range and then had to scroll back down through it
+// before the view moved again.
+//
+// viewH is the height last passed to View/CursorInView. If the screen has not
+// been rendered yet (viewH == 0), we fall back to total-1 so ScrollTo still has
+// a sane ceiling; the first render tightens it.
+func (s *Screen) ScrollTo(off int) {
+	max := s.scrollMax()
+	switch {
+	case off < 0:
+		off = 0
+	case off > max:
+		off = max
+	}
+	s.scrollOff = off
+}
+
+// scrollMax is the largest meaningful offset given the known view height.
+func (s *Screen) scrollMax() int {
+	total := len(s.rows)
+	if total < 1 {
+		return 0
+	}
+	if s.viewH > 0 && total-s.viewH > 0 {
+		return total - s.viewH
+	}
+	// No view height known yet, or the whole buffer fits: allow up to total-1
+	// as a harmless ceiling; the next View() call tightens it.
+	return total - 1
+}
+
+// ResetScroll re-anchors the view to live (bottom) output.
+func (s *Screen) ResetScroll() { s.scrollOff = 0 }
 
 // curColRow ensures curRow references a real row; grows scrollback as needed.
 func (s *Screen) ensureRow(r int) {
