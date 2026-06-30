@@ -50,14 +50,10 @@ func main() {
 		KnownHostsPath: filepath.Join(dir, "known_hosts"),
 	})
 
-	// NOTE: mouse reporting (WithMouseCellMotion) is intentionally NOT enabled.
-	// It conflicts with the host terminal's native text selection/copy: on
-	// Windows Terminal it blocks selection entirely (the console mouse API is
-	// exclusive), and on GNOME Terminal multi-line selection also grabs the
-	// pane borders. Mouse-wheel scrolling is handled by the host terminal's
-	// own scrollback instead, and in-app history review uses the keyboard
-	// (Shift+arrows, PgUp/PgDn, g/G).
-	p := tea.NewProgram(app, tea.WithAltScreen())
+	// Mouse reporting lets xcx own terminal-pane scrolling and selection.
+	// Native host-terminal selection is intercepted while this is enabled, so
+	// the app implements Windows Terminal-style left-select/right-copy-paste.
+	p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "xcx: %v\n", err)
 		os.Exit(1)

@@ -102,6 +102,17 @@ func TestScroll_ResetScroll(t *testing.T) {
 	}
 }
 
+func TestScreenOutputVersion(t *testing.T) {
+	s := NewScreen(3)
+	if got := s.OutputVersion(); got != 0 {
+		t.Fatalf("initial output version = %d, want 0", got)
+	}
+	s.MarkOutput()
+	if got := s.OutputVersion(); got != 1 {
+		t.Fatalf("after MarkOutput version = %d, want 1", got)
+	}
+}
+
 // TestScroll_NoDeadZoneAtTop reproduces the bug where scrolling past the top of
 // scrollback built up offset in a "dead zone" (offsets between total-height and
 // total-1 all render the same top-anchored view), so the user had to scroll

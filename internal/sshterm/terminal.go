@@ -117,6 +117,12 @@ func (t *Terminal) Start(ctx context.Context) {
 // concurrently with the running read loop.
 func (t *Terminal) Screen() *Screen { return t.screen }
 
+// BracketedPaste reports whether pasted input should be wrapped in xterm's
+// bracketed paste markers for the remote program.
+func (t *Terminal) BracketedPaste() bool {
+	return t.parser != nil && t.parser.BracketedPaste()
+}
+
 // NewTerminalWithScreen builds a Terminal that has no live PTY but owns the
 // given Screen. It is intended for tests that exercise the Screen-backed
 // helpers (Scroll, View, rendering) without standing up a real SSH session.
@@ -194,6 +200,7 @@ func (t *Terminal) readLoop(ctx context.Context) {
 			// of a row are acceptable since the UI re-renders at its own frame
 			// rate. New output also cancels any scroll-back so the view jumps
 			// back to live (bottom) output, mirroring real terminals.
+			t.screen.MarkOutput()
 			t.screen.ResetScroll()
 			t.parser.Write(buf[:n])
 		}

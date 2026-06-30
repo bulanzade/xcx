@@ -49,6 +49,8 @@ type Options struct {
 	VaultPath string
 	// KnownHostsPath is the known_hosts file path.
 	KnownHostsPath string
+	// Clipboard overrides system clipboard access in tests.
+	Clipboard appClipboard
 }
 
 // App is the top-level Bubble Tea model. It owns the active view and the
@@ -68,6 +70,7 @@ type App struct {
 	master   string // current master password (needed to Save)
 	verifier *session.HostKeyVerifier
 	queue    *transfer.Queue
+	clip     appClipboard
 
 	// active connection
 	sess          *session.Session
@@ -113,6 +116,11 @@ func New(opts Options) *App {
 		queue:  transfer.NewQueue(1),
 		unlock: u,
 	}
+	if opts.Clipboard != nil {
+		a.clip = opts.Clipboard
+	} else {
+		a.clip = systemClipboard{}
+	}
 	return a
 }
 
@@ -140,6 +148,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		a.terminal, cmd = a.terminal.Update(a, msg)
 		return a, cmd
+
+	case tea.MouseMsg:
+		if a.view == viewMain {
+			return a.handleMouse(msg)
+		}
+		return a, nil
 
 	case tea.KeyMsg:
 		if a.view != viewMain {
@@ -172,6 +186,53 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, cmd
 	}
 	return a.dispatchModal(msg)
+}
+
+func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if a.right != rightTerminal || a.terminal.term == nil {
+		return a, nil
+	}
+	x, y, ok := a.terminalContentPoint(msg.X, msg.Y)
+	if !ok && msg.Button != tea.MouseButtonLeft {
+		return a, nil
+	}
+	var cmd tea.Cmd
+	a.terminal, cmd = a.terminal.Update(a, terminalMouseMsg{
+		msg:    msg,
+		col:    x,
+		row:    y,
+		inside: ok,
+	})
+	return a, cmd
+}
+
+func (a *App) terminalContentPoint(x, y int) (int, int, bool) {
+	leftW, _, _ := a.layout()
+	w, h := a.RightSize()
+	// The terminal pane uses a one-cell Lip Gloss border. RightSize() returns
+	// the content box inside that frame, so mouse coordinates must skip the
+	// left pane, the one-column split gap, and the terminal frame's top/left
+	// cell before they can be interpreted as PTY cell coordinates.
+	contentX := leftW + 2
+	contentY := 1
+	if x < contentX || x >= contentX+w || y < contentY || y >= contentY+h {
+		return clampInt(x-contentX, 0, w-1), clampInt(y-contentY, 0, h-1), false
+	}
+	return x - contentX, y - contentY, true
+}
+
+func clampInt(v, lo, hi int) int {
+	if hi < lo {
+		return lo
+	}
+	switch {
+	case v < lo:
+		return lo
+	case v > hi:
+		return hi
+	default:
+		return v
+	}
 }
 
 func (a *App) handleTab() (tea.Model, tea.Cmd) {

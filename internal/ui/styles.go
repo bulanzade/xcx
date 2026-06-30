@@ -82,7 +82,14 @@ func itoa(i int) string {
 // cursorCol, when >= 0, marks the column of the terminal cursor on this row;
 // that cell is rendered with reverse video forced on so the cursor is visible
 // as an inverted block regardless of the cell's underlying style.
-func renderRow(row []sshterm.Cell, width, cursorCol int) string {
+func renderRow(row []sshterm.Cell, width, cursorCol int, selection ...int) string {
+	selStart, selEnd := -1, -1
+	if len(selection) >= 2 {
+		selStart, selEnd = selection[0], selection[1]
+		if selStart > selEnd {
+			selStart, selEnd = selEnd, selStart
+		}
+	}
 	var b strings.Builder
 	var curStyle sshterm.Style
 	var styled bool // true while accumulating a styled span
@@ -129,6 +136,8 @@ func renderRow(row []sshterm.Cell, width, cursorCol int) string {
 			// including blank cells at end-of-line, whose zero-value style is
 			// {Fg:0,Bg:0} (black); without this reset, a reversed black-on-black
 			// block was invisible there.
+			st = sshterm.Style{Fg: -1, Bg: -1, Rev: true}
+		} else if c >= selStart && c <= selEnd {
 			st = sshterm.Style{Fg: -1, Bg: -1, Rev: true}
 		}
 		def := isDefaultStyle(st)

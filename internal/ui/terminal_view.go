@@ -20,11 +20,34 @@ type terminalModel struct {
 	cancel     context.CancelFunc
 	ticking    bool
 	writeInput func([]byte) error
+	selection  terminalSelection
 }
 
 func newTerminalModel() terminalModel {
 	return terminalModel{}
 }
+
+type terminalPoint struct {
+	row int
+	col int
+}
+
+type terminalSelection struct {
+	selecting bool
+	active    bool
+	version   uint64
+	anchor    terminalPoint
+	cursor    terminalPoint
+}
+
+type terminalMouseMsg struct {
+	msg    tea.MouseMsg
+	row    int
+	col    int
+	inside bool
+}
+
+const terminalSelectionRowEnd = 1 << 30
 
 // openTerminalCmd starts the terminal once a session is attached. It returns a
 // tea.Cmd that performs the PTY setup in a goroutine and emits a message.
@@ -106,6 +129,7 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 		}
 		return m, nil
 	case terminalRefreshMsg:
+		m.clearSelectionIfOutputChanged()
 		return m, terminalRefresh()
 	case terminalDoneMsg:
 		if msg.term != nil && m.term != msg.term {
@@ -140,11 +164,24 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 			_ = m.term.Resize(w, h)
 		}
 		return m, nil
+	case terminalMouseMsg:
+		if m.clearSelectionIfOutputChanged() && msg.msg.Button == tea.MouseButtonRight && msg.msg.Action == tea.MouseActionPress {
+			app.status = "selection cleared after output"
+			app.err = ""
+			return m, nil
+		}
+		return m.handleMouse(app, msg)
 	case tea.KeyMsg:
 		if m.term == nil && m.writeInput == nil {
 			return m, nil
 		}
 		switch msg.Type {
+		case tea.KeyCtrlC:
+			if m.hasSelection() {
+				m.copySelection(app)
+				m.clearSelection()
+				return m, nil
+			}
 		case tea.KeyCtrlBackslash:
 			app.closeTerminal()
 			return m, nil
@@ -152,9 +189,11 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 			app.openSFTPFromTerminal()
 			return m, nil
 		case tea.KeyShiftUp:
+			m.clearSelection()
 			m.scroll(1)
 			return m, nil
 		case tea.KeyShiftDown:
+			m.clearSelection()
 			m.scroll(-1)
 			return m, nil
 		case tea.KeyPgUp, tea.KeyPgDown:
@@ -169,6 +208,7 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 			if msg.Type == tea.KeyPgDown {
 				delta = -h
 			}
+			m.clearSelection()
 			m.scroll(delta)
 			return m, nil
 		}
@@ -183,17 +223,82 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 			if len(msg.Runes) == 1 {
 				switch msg.Runes[0] {
 				case 'g':
+					m.clearSelection()
 					m.jumpTop()
 					return m, nil
 				case 'G':
+					m.clearSelection()
 					m.jumpBottom()
 					return m, nil
 				}
 			}
 		}
+		m.clearSelection()
 		if err := m.write(encodeKey(msg)); err != nil {
 			app.err = fmt.Sprintf("write: %v", err)
 		}
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m terminalModel) handleMouse(app *App, msg terminalMouseMsg) (terminalModel, tea.Cmd) {
+	switch msg.msg.Button {
+	case tea.MouseButtonWheelUp:
+		if msg.inside && msg.msg.Action == tea.MouseActionPress {
+			m.clearSelection()
+			m.scroll(3)
+		}
+		return m, nil
+	case tea.MouseButtonWheelDown:
+		if msg.inside && msg.msg.Action == tea.MouseActionPress {
+			m.clearSelection()
+			m.scroll(-3)
+		}
+		return m, nil
+	case tea.MouseButtonLeft, tea.MouseButtonNone:
+		switch msg.msg.Action {
+		case tea.MouseActionPress:
+			if msg.msg.Button == tea.MouseButtonLeft && msg.inside {
+				p := terminalPoint{row: msg.row, col: msg.col}
+				m.selection = terminalSelection{
+					selecting: true,
+					active:    true,
+					version:   m.outputVersion(),
+					anchor:    p,
+					cursor:    p,
+				}
+			} else {
+				m.clearSelection()
+			}
+		case tea.MouseActionMotion:
+			if m.selection.selecting {
+				m.selection.cursor = terminalPoint{row: msg.row, col: msg.col}
+				m.selection.active = true
+			}
+		case tea.MouseActionRelease:
+			if m.selection.selecting {
+				m.selection.cursor = terminalPoint{row: msg.row, col: msg.col}
+				m.selection.selecting = false
+				if m.selectedText(app) == "" {
+					m.clearSelection()
+				}
+			}
+		}
+		return m, nil
+	case tea.MouseButtonRight:
+		if msg.msg.Action != tea.MouseActionPress {
+			return m, nil
+		}
+		if !msg.inside {
+			return m, nil
+		}
+		if m.hasSelection() {
+			m.copySelection(app)
+			m.clearSelection()
+			return m, nil
+		}
+		m.pasteClipboard(app)
 		return m, nil
 	}
 	return m, nil
@@ -204,6 +309,90 @@ func (m terminalModel) write(input []byte) error {
 		return m.writeInput(input)
 	}
 	return m.term.WriteInput(input)
+}
+
+func (m terminalModel) writePaste(input string) error {
+	input = strings.ReplaceAll(input, "\r\n", "\n")
+	input = strings.ReplaceAll(input, "\r", "\n")
+	if m.term != nil && m.term.BracketedPaste() {
+		input = "\x1b[200~" + input + "\x1b[201~"
+	}
+	return m.write([]byte(input))
+}
+
+func (m terminalModel) pasteClipboard(app *App) {
+	text, err := app.clip.Paste()
+	if err != nil {
+		app.err = fmt.Sprintf("paste: %v", err)
+		return
+	}
+	if text == "" {
+		app.status = "nothing to paste"
+		app.err = ""
+		return
+	}
+	if err := m.writePaste(text); err != nil {
+		app.err = fmt.Sprintf("paste: %v", err)
+		return
+	}
+	app.status = fmt.Sprintf("pasted %d chars", len([]rune(text)))
+	app.err = ""
+}
+
+func (m terminalModel) copySelection(app *App) {
+	text := m.selectedText(app)
+	if text == "" {
+		app.status = "nothing selected"
+		app.err = ""
+		return
+	}
+	method, err := app.clip.Copy(text)
+	if err != nil {
+		app.err = fmt.Sprintf("copy: %v", err)
+		return
+	}
+	if method == "" {
+		method = "clipboard"
+	}
+	app.status = fmt.Sprintf("copied %d chars via %s", len([]rune(text)), method)
+	app.err = ""
+}
+
+func (m terminalModel) selectedText(app *App) string {
+	if !m.hasSelection() || m.term == nil {
+		return ""
+	}
+	if m.selection.version != m.outputVersion() {
+		return ""
+	}
+	_, h := app.RightSize()
+	return m.term.Screen().TextRange(h,
+		sshterm.Point{Row: m.selection.anchor.row, Col: m.selection.anchor.col},
+		sshterm.Point{Row: m.selection.cursor.row, Col: m.selection.cursor.col},
+	)
+}
+
+func (m terminalModel) hasSelection() bool {
+	return m.selection.active
+}
+
+func (m *terminalModel) clearSelection() {
+	m.selection = terminalSelection{}
+}
+
+func (m terminalModel) outputVersion() uint64 {
+	if m.term == nil {
+		return 0
+	}
+	return m.term.Screen().OutputVersion()
+}
+
+func (m *terminalModel) clearSelectionIfOutputChanged() bool {
+	if m.hasSelection() && m.selection.version != m.outputVersion() {
+		m.clearSelection()
+		return true
+	}
+	return false
 }
 
 // scroll moves the terminal view by delta rows (positive = up into history).
@@ -247,6 +436,7 @@ func (m terminalModel) View(app *App) string {
 	if m.term == nil {
 		return dimStyle.Render("starting terminal…")
 	}
+	m.clearSelectionIfOutputChanged()
 	w, h := app.RightSize()
 	screen := m.term.Screen()
 	view := screen.View(h)
@@ -262,11 +452,42 @@ func (m terminalModel) View(app *App) string {
 		if r == curRow && curCol >= 0 && curCol < w {
 			cursorCol = curCol
 		}
-		s := renderRow(row, w, cursorCol)
+		selStart, selEnd := m.selectionRangeForRow(r)
+		s := renderRow(row, w, cursorCol, selStart, selEnd)
 		b.WriteString(s)
 		b.WriteString("\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m terminalModel) selectionRangeForRow(row int) (int, int) {
+	if !m.hasSelection() {
+		return -1, -1
+	}
+	start, end := m.selection.anchor, m.selection.cursor
+	if afterPoint(start, end) {
+		start, end = end, start
+	}
+	if row < start.row || row > end.row {
+		return -1, -1
+	}
+	switch {
+	case start.row == end.row:
+		return start.col, end.col
+	case row == start.row:
+		return start.col, terminalSelectionRowEnd
+	case row == end.row:
+		return 0, end.col
+	default:
+		return 0, terminalSelectionRowEnd
+	}
+}
+
+func afterPoint(a, b terminalPoint) bool {
+	if a.row != b.row {
+		return a.row > b.row
+	}
+	return a.col > b.col
 }
 
 // close stops the terminal read loop and frees resources.

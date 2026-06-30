@@ -2,6 +2,7 @@ package sshterm
 
 import (
 	"strconv"
+	"sync/atomic"
 	"unicode/utf8"
 )
 
@@ -36,6 +37,8 @@ type Parser struct {
 
 	// oscBuf accumulates the payload of an in-progress OSC sequence.
 	oscBuf []byte
+
+	bracketedPaste atomic.Bool
 }
 
 // Responder is the interface for sending response bytes back to the remote
@@ -47,6 +50,10 @@ type Responder interface {
 // SetResponder wires a response callback for query sequences. The Terminal
 // connects this to its stdin writer so replies reach the remote program.
 func (p *Parser) SetResponder(r func(b []byte)) { p.respond = r }
+
+// BracketedPaste reports whether the remote program currently requested
+// bracketed paste mode via CSI ? 2004 h/l.
+func (p *Parser) BracketedPaste() bool { return p.bracketedPaste.Load() }
 
 type parseState int
 
@@ -356,6 +363,14 @@ func (p *Parser) dispatchCSI(final rune) {
 	// digits don't leak as visible text. We don't act on them in this MVP, so
 	// just drop the whole sequence.
 	if p.private != 0 {
+		if p.private == '?' && len(p.params) > 0 && p.params[0] == 2004 {
+			switch final {
+			case 'h':
+				p.bracketedPaste.Store(true)
+			case 'l':
+				p.bracketedPaste.Store(false)
+			}
+		}
 		return
 	}
 	switch final {

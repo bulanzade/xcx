@@ -1,5 +1,7 @@
 package sshterm
 
+import "sync/atomic"
+
 // Screen is a minimal character grid that emulates the subset of xterm
 // behavior needed for interactive shells: writing printable text, line
 // wrapping, cursor movement, carriage return, newline, backspace, and the
@@ -32,12 +34,20 @@ type Screen struct {
 	// topmost reachable row. 0 until the first render; ScrollTo falls back to a
 	// looser ceiling in that case.
 	viewH int
+
+	outputVersion atomic.Uint64
 }
 
 // Cell is one screen position: a rune plus SGR style bits.
 type Cell struct {
 	Ch    rune
 	Style Style
+}
+
+// Point is a row/column coordinate in the currently visible terminal window.
+type Point struct {
+	Row int
+	Col int
 }
 
 // Style holds foreground/background color codes (16-color ANSI for MVP) plus
@@ -93,6 +103,93 @@ func (s *Screen) View(height int) [][]Cell {
 	return s.rows[start:end]
 }
 
+// TextRange extracts plain text from the current visible window. Coordinates
+// are inclusive and are clamped to the visible window.
+func (s *Screen) TextRange(height int, start, end Point) string {
+	if height < 1 || s.cols < 1 {
+		return ""
+	}
+	view := s.View(height)
+	if len(view) == 0 {
+		return ""
+	}
+	start = clampPoint(start, height, s.cols)
+	end = clampPoint(end, height, s.cols)
+	if pointAfter(start, end) {
+		start, end = end, start
+	}
+	var out []rune
+	for r := start.Row; r <= end.Row; r++ {
+		var row []Cell
+		if r >= 0 && r < len(view) {
+			row = view[r]
+		}
+		from, to := 0, s.cols-1
+		if r == start.Row {
+			from = start.Col
+		}
+		if r == end.Row {
+			to = end.Col
+		}
+		if from < 0 {
+			from = 0
+		}
+		if to >= s.cols {
+			to = s.cols - 1
+		}
+		line := cellsText(row, from, to)
+		out = append(out, line...)
+		if r != end.Row {
+			out = append(out, '\n')
+		}
+	}
+	return string(out)
+}
+
+func cellsText(row []Cell, from, to int) []rune {
+	if to < from {
+		return nil
+	}
+	line := make([]rune, 0, to-from+1)
+	for c := from; c <= to; c++ {
+		ch := rune(0)
+		if c < len(row) {
+			ch = row[c].Ch
+		}
+		if ch == 0 {
+			ch = ' '
+		}
+		line = append(line, ch)
+	}
+	for len(line) > 0 && line[len(line)-1] == ' ' {
+		line = line[:len(line)-1]
+	}
+	return line
+}
+
+func clampPoint(p Point, rows, cols int) Point {
+	if p.Row < 0 {
+		p.Row = 0
+	}
+	if p.Row >= rows {
+		p.Row = rows - 1
+	}
+	if p.Col < 0 {
+		p.Col = 0
+	}
+	if p.Col >= cols {
+		p.Col = cols - 1
+	}
+	return p
+}
+
+func pointAfter(a, b Point) bool {
+	if a.Row != b.Row {
+		return a.Row > b.Row
+	}
+	return a.Col > b.Col
+}
+
 // Cursor returns the current (row, col) cursor position.
 func (s *Screen) Cursor() (int, int) { return s.curRow, s.curCol }
 
@@ -119,6 +216,14 @@ func (s *Screen) CursorInView(height int) (int, int) {
 // ScrollOffset returns how many rows above the live bottom the view is scrolled
 // back (0 = live output).
 func (s *Screen) ScrollOffset() int { return s.scrollOff }
+
+// OutputVersion changes whenever the remote output stream appends more data.
+// UI selections are anchored to visible coordinates, so callers can use this to
+// invalidate selections before copying stale coordinates from a shifted view.
+func (s *Screen) OutputVersion() uint64 { return s.outputVersion.Load() }
+
+// MarkOutput records that remote output changed the backing screen.
+func (s *Screen) MarkOutput() { s.outputVersion.Add(1) }
 
 // Scroll moves the view by delta rows (positive = further up into scrollback,
 // negative = back toward live output). The offset is clamped by ScrollTo to the
