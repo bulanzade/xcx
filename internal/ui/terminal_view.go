@@ -175,6 +175,13 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 		if m.term == nil && m.writeInput == nil {
 			return m, nil
 		}
+		if msg.Paste {
+			m.clearSelection()
+			if err := m.writePaste(string(msg.Runes)); err != nil {
+				app.err = fmt.Sprintf("paste: %v", err)
+			}
+			return m, nil
+		}
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			if m.hasSelection() {
@@ -312,12 +319,14 @@ func (m terminalModel) write(input []byte) error {
 }
 
 func (m terminalModel) writePaste(input string) error {
+	return m.write([]byte(normalizePasteInput(input)))
+}
+
+func normalizePasteInput(input string) string {
 	input = strings.ReplaceAll(input, "\r\n", "\n")
 	input = strings.ReplaceAll(input, "\r", "\n")
-	if m.term != nil && m.term.BracketedPaste() {
-		input = "\x1b[200~" + input + "\x1b[201~"
-	}
-	return m.write([]byte(input))
+	input = strings.TrimRight(input, "\n")
+	return strings.ReplaceAll(input, "\n", "\r")
 }
 
 func (m terminalModel) pasteClipboard(app *App) {

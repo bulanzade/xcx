@@ -176,8 +176,38 @@ func TestTerminalRightPasteWhenNoSelection(t *testing.T) {
 
 	sendTerminalMouse(app, tea.MouseButtonRight, tea.MouseActionPress, 0, 0)
 
-	if got := string(wrote); got != "a\nb" {
-		t.Fatalf("paste wrote %q, want normalized text", got)
+	if got := string(wrote); got != "a\rb" {
+		t.Fatalf("paste wrote %q, want CR-normalized text", got)
+	}
+}
+
+func TestNormalizePasteInputUsesPTYEnter(t *testing.T) {
+	if got := normalizePasteInput("a\r\nb\nc\rd\n"); got != "a\rb\rc\rd" {
+		t.Fatalf("normalizePasteInput = %q, want CR line endings without trailing submit", got)
+	}
+}
+
+func TestTerminalBracketedPasteKeySendsNewlinesAsEnter(t *testing.T) {
+	app := New(Options{Clipboard: &fakeClipboard{}})
+	app.view = viewMain
+	app.right = rightTerminal
+	app.focus = focusRight
+	var wrote []byte
+	app.terminal = terminalModel{
+		writeInput: func(input []byte) error {
+			wrote = append(wrote, input...)
+			return nil
+		},
+	}
+
+	_, _ = app.Update(tea.KeyMsg{
+		Type:  tea.KeyRunes,
+		Runes: []rune("ls \\\n-l\n"),
+		Paste: true,
+	})
+
+	if got := string(wrote); got != "ls \\\r-l" {
+		t.Fatalf("pasted bytes = %q, want trailing paste newline stripped", got)
 	}
 }
 
