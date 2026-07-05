@@ -224,6 +224,7 @@ func (a *App) handleDialResult(msg dialResultMsg) tea.Cmd {
 	switch {
 	case msg.sess != nil:
 		a.err = ""
+		a.view = viewMain
 		if msg.forSFTP {
 			a.storeActiveTerminal()
 			oldSess := a.sess
