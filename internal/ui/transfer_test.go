@@ -29,7 +29,7 @@ func newLocalPane(t *testing.T, dir string) *pane {
 }
 
 // TestTransfer_EnqueuesAndCopies is the regression test for the bug where
-// pressing F5/F6 copied nothing: transfer() called queue.Run with a closure but
+// pressing F5 copied nothing: transfer() called queue.Run with a closure but
 // never Enqueued any Job, so Run found an empty queue and returned immediately.
 // This test asserts a job lands in the queue AND the file actually transfers.
 func TestTransfer_EnqueuesAndCopies(t *testing.T) {
@@ -95,6 +95,44 @@ func TestSFTPUpdateF5EnqueuesTransfer(t *testing.T) {
 
 	if n := app.queue.Len(); n == 0 {
 		t.Fatal("F5 did not enqueue any transfer job")
+	}
+}
+
+// TestSFTPTransferKeyBindings locks in the SFTP transfer key map: F5 and 't'
+// both start a transfer (they're aliases), while F6 is intentionally NOT a
+// transfer key anymore — Midnight Commander's F5/F6 = copy/move split is not
+// implemented, so a second identical key would be a misleading alias.
+func TestSFTPTransferKeyBindings(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  tea.KeyMsg
+		want bool // true = should enqueue a transfer
+	}{
+		{"F5", tea.KeyMsg{Type: tea.KeyF5}, true},
+		{"t", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}}, true},
+		{"F6", tea.KeyMsg{Type: tea.KeyF6}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srcDir := t.TempDir()
+			dstDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("payload"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			app := New(Options{})
+			m := sftpModel{
+				local:  newLocalPane(t, srcDir),
+				remote: newLocalPane(t, dstDir),
+			}
+			m.focused = m.local
+			m.local.selected["a.txt"] = true
+
+			m, _ = m.Update(app, tc.key)
+
+			got := app.queue.Len() > 0
+			if got != tc.want {
+				t.Fatalf("%s enqueue = %v, want %v", tc.name, got, tc.want)
+			}
+		})
 	}
 }
 

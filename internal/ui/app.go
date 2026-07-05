@@ -106,6 +106,22 @@ type transferStatus struct {
 	err       string
 }
 
+// transferTickMsg drives a periodic repaint of the status bar while an SFTP
+// transfer is in flight. Without it the status bar only updated when the user
+// pressed a key: the consumer goroutine writes progress to transferStatus
+// under statusMu, but Bubble Tea only re-renders in response to a message, so
+// the running percentage/speed never refreshed on its own. App.Update returns
+// the next transferTick cmd only while a transfer is active, so the loop stops
+// (no busy loop) once transfers complete.
+type transferTickMsg struct{}
+
+// transferTick returns a cmd that fires a transferTickMsg after the refresh
+// interval. The interval is a balance: fast enough that the %/speed looks live
+// (100ms), slow enough not to peg the CPU on large transfers.
+func transferTick() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg { return transferTickMsg{} })
+}
+
 // New returns a new App initialized for the unlock screen.
 func New(opts Options) *App {
 	u := newUnlockModel()
@@ -143,6 +159,19 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// An async SSH dial completed (terminal or SFTP). Route the result
 		// without blocking — the dial already ran in a goroutine via dialCmd.
 		return a, a.handleDialResult(msg)
+
+	case transferTickMsg:
+		// Keep the status-bar repaint loop alive only while a transfer is
+		// active. Reading active under statusMu matches the writer side
+		// (updateTransferProgress/finishTransfer); once the transfer finishes
+		// finishTransfer clears active, so this returns nil and the loop stops.
+		a.statusMu.RLock()
+		active := a.transfer.active
+		a.statusMu.RUnlock()
+		if active {
+			return a, transferTick()
+		}
+		return a, nil
 
 	case terminalStartedMsg, terminalErrorMsg, terminalDoneMsg, terminalRefreshMsg:
 		var cmd tea.Cmd

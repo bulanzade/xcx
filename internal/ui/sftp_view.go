@@ -152,10 +152,17 @@ func (m sftpModel) Update(app *App, msg tea.Msg) (sftpModel, tea.Cmd) {
 		}
 	case k.String() == "r":
 		_ = m.focused.refresh()
-	case k.Type == tea.KeyF5:
+	case k.Type == tea.KeyF5, k.String() == "t":
+		// F5 and 't' (transfer) are aliases. Direction is decided by which
+		// pane is focused (Local→Remote is upload, Remote→Local is download),
+		// not by the key. F6 is intentionally NOT a separate action: Midnight
+		// Commander's F5/F6 = copy/move split is not implemented here, so a
+		// second identical key would just be a misleading alias.
 		m.transfer(app)
-	case k.Type == tea.KeyF6:
-		m.transfer(app)
+		// Kick off the status-bar auto-refresh loop so the running percentage
+		// and speed repaint during the transfer without needing user input.
+		// App.Update reschedules the tick only while a transfer stays active.
+		return m, transferTick()
 	case k.Type == tea.KeyF7:
 		m.mkdir()
 	case k.Type == tea.KeyF8, k.String() == "delete":
@@ -307,7 +314,7 @@ func (m sftpModel) View(app *App) string {
 	right := m.renderPane(m.remote, rightFocused && m.focused == m.remote, paneW, bodyH, "Remote")
 	row := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 
-	footer := dimStyle.Render("[Tab] switch  [Enter] open  [Backspace] up  [Space] select  [F5] copy  [F7] mkdir  [F8] del  [r] refresh  [Esc] back")
+	footer := dimStyle.Render("[Tab] switch  [Enter] open  [Backspace] up  [Space] select  [F5/t] copy  [F7] mkdir  [F8] del  [r] refresh  [Esc] back")
 	return titleStyle.Render("SFTP") + "\n" + row + "\n" + footer
 }
 
