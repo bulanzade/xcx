@@ -221,8 +221,8 @@ func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if a.right != rightTerminal || a.terminal.term == nil {
 		return a, nil
 	}
-	x, y, ok := a.terminalContentPoint(msg.X, msg.Y)
-	if !ok && msg.Button != tea.MouseButtonLeft {
+	x, y, ok, edgeScroll := a.terminalContentPoint(msg.X, msg.Y)
+	if !ok && msg.Button != tea.MouseButtonLeft && msg.Action != tea.MouseActionRelease {
 		return a, nil
 	}
 	var cmd tea.Cmd
@@ -231,11 +231,12 @@ func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		col:    x,
 		row:    y,
 		inside: ok,
+		scroll: edgeScroll,
 	})
 	return a, cmd
 }
 
-func (a *App) terminalContentPoint(x, y int) (int, int, bool) {
+func (a *App) terminalContentPoint(x, y int) (int, int, bool, int) {
 	leftW, _, _ := a.layout()
 	w, h := a.RightSize()
 	// The terminal pane uses a one-cell Lip Gloss border. RightSize() returns
@@ -244,10 +245,17 @@ func (a *App) terminalContentPoint(x, y int) (int, int, bool) {
 	// cell before they can be interpreted as PTY cell coordinates.
 	contentX := leftW + 2
 	contentY := 1
-	if x < contentX || x >= contentX+w || y < contentY || y >= contentY+h {
-		return clampInt(x-contentX, 0, w-1), clampInt(y-contentY, 0, h-1), false
+	edgeScroll := 0
+	switch {
+	case y < contentY:
+		edgeScroll = 1
+	case y >= contentY+h:
+		edgeScroll = -1
 	}
-	return x - contentX, y - contentY, true
+	if x < contentX || x >= contentX+w || y < contentY || y >= contentY+h {
+		return clampInt(x-contentX, 0, w-1), clampInt(y-contentY, 0, h-1), false, edgeScroll
+	}
+	return x - contentX, y - contentY, true, edgeScroll
 }
 
 func clampInt(v, lo, hi int) int {

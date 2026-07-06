@@ -89,9 +89,25 @@ func (s *Screen) Rows() int { return len(s.rows) }
 // past the topmost reachable row.
 func (s *Screen) View(height int) [][]Cell {
 	s.viewH = height
+	start, end := s.viewBounds(height)
+	if start == 0 && end == len(s.rows) {
+		return s.rows
+	}
+	return s.rows[start:end]
+}
+
+// ViewStart returns the absolute scrollback row shown at visible row 0 for the
+// current view height.
+func (s *Screen) ViewStart(height int) int {
+	s.viewH = height
+	start, _ := s.viewBounds(height)
+	return start
+}
+
+func (s *Screen) viewBounds(height int) (int, int) {
 	total := len(s.rows)
 	if height >= total {
-		return s.rows
+		return 0, total
 	}
 	// Live (offset 0): bottom-anchored window rows[total-height:].
 	// Scrolled back (offset n): shift the window up by n -> rows[total-height-n : total-n].
@@ -100,7 +116,7 @@ func (s *Screen) View(height int) [][]Cell {
 		end = height
 	}
 	start := end - height
-	return s.rows[start:end]
+	return start, end
 }
 
 // TextRange extracts plain text from the current visible window. Coordinates
@@ -136,6 +152,40 @@ func (s *Screen) TextRange(height int, start, end Point) string {
 		}
 		if to >= s.cols {
 			to = s.cols - 1
+		}
+		line := cellsText(row, from, to)
+		out = append(out, line...)
+		if r != end.Row {
+			out = append(out, '\n')
+		}
+	}
+	return string(out)
+}
+
+// TextRangeAbs extracts plain text using absolute scrollback row coordinates.
+// Columns are still terminal cell coordinates and all coordinates are
+// inclusive.
+func (s *Screen) TextRangeAbs(start, end Point) string {
+	if len(s.rows) == 0 || s.cols < 1 {
+		return ""
+	}
+	start = clampPoint(start, len(s.rows), s.cols)
+	end = clampPoint(end, len(s.rows), s.cols)
+	if pointAfter(start, end) {
+		start, end = end, start
+	}
+	var out []rune
+	for r := start.Row; r <= end.Row; r++ {
+		var row []Cell
+		if r >= 0 && r < len(s.rows) {
+			row = s.rows[r]
+		}
+		from, to := 0, s.cols-1
+		if r == start.Row {
+			from = start.Col
+		}
+		if r == end.Row {
+			to = end.Col
 		}
 		line := cellsText(row, from, to)
 		out = append(out, line...)

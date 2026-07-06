@@ -38,6 +38,9 @@ type terminalSelection struct {
 	version   uint64
 	anchor    terminalPoint
 	cursor    terminalPoint
+	dragRow   int
+	dragCol   int
+	scroll    int
 }
 
 type terminalMouseMsg struct {
@@ -45,9 +48,13 @@ type terminalMouseMsg struct {
 	row    int
 	col    int
 	inside bool
+	scroll int
 }
 
-const terminalSelectionRowEnd = 1 << 30
+const (
+	terminalSelectionRowEnd     = 1 << 30
+	terminalSelectionScrollStep = 1
+)
 
 // openTerminalCmd starts the terminal once a session is attached. It returns a
 // tea.Cmd that performs the PTY setup in a goroutine and emits a message.
@@ -130,6 +137,7 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 		return m, nil
 	case terminalRefreshMsg:
 		m.clearSelectionIfOutputChanged()
+		m.scrollSelectionDrag(app)
 		return m, terminalRefresh()
 	case terminalDoneMsg:
 		if msg.term != nil && m.term != msg.term {
@@ -240,8 +248,12 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 				}
 			}
 		}
+		input := encodeKey(msg)
+		if len(input) == 0 {
+			return m, nil
+		}
 		m.clearSelection()
-		if err := m.write(encodeKey(msg)); err != nil {
+		if err := m.write(input); err != nil {
 			app.err = fmt.Sprintf("write: %v", err)
 		}
 		return m, nil
@@ -253,13 +265,11 @@ func (m terminalModel) handleMouse(app *App, msg terminalMouseMsg) (terminalMode
 	switch msg.msg.Button {
 	case tea.MouseButtonWheelUp:
 		if msg.inside && msg.msg.Action == tea.MouseActionPress {
-			m.clearSelection()
 			m.scroll(3)
 		}
 		return m, nil
 	case tea.MouseButtonWheelDown:
 		if msg.inside && msg.msg.Action == tea.MouseActionPress {
-			m.clearSelection()
 			m.scroll(-3)
 		}
 		return m, nil
@@ -267,25 +277,33 @@ func (m terminalModel) handleMouse(app *App, msg terminalMouseMsg) (terminalMode
 		switch msg.msg.Action {
 		case tea.MouseActionPress:
 			if msg.msg.Button == tea.MouseButtonLeft && msg.inside {
-				p := terminalPoint{row: msg.row, col: msg.col}
+				p := m.selectionPoint(app, msg.row, msg.col)
 				m.selection = terminalSelection{
 					selecting: true,
 					active:    true,
 					version:   m.outputVersion(),
 					anchor:    p,
 					cursor:    p,
+					dragRow:   msg.row,
+					dragCol:   msg.col,
 				}
 			} else {
 				m.clearSelection()
 			}
 		case tea.MouseActionMotion:
 			if m.selection.selecting {
-				m.selection.cursor = terminalPoint{row: msg.row, col: msg.col}
+				m.selection.dragRow = msg.row
+				m.selection.dragCol = msg.col
+				m.selection.scroll = msg.scroll
+				m.scrollSelectionDrag(app)
 				m.selection.active = true
 			}
 		case tea.MouseActionRelease:
 			if m.selection.selecting {
-				m.selection.cursor = terminalPoint{row: msg.row, col: msg.col}
+				m.selection.dragRow = msg.row
+				m.selection.dragCol = msg.col
+				m.selection.scroll = 0
+				m.selection.cursor = m.selectionPoint(app, msg.row, msg.col)
 				m.selection.selecting = false
 				if m.selectedText(app) == "" {
 					m.clearSelection()
@@ -374,8 +392,7 @@ func (m terminalModel) selectedText(app *App) string {
 	if m.selection.version != m.outputVersion() {
 		return ""
 	}
-	_, h := app.RightSize()
-	return m.term.Screen().TextRange(h,
+	return m.term.Screen().TextRangeAbs(
 		sshterm.Point{Row: m.selection.anchor.row, Col: m.selection.anchor.col},
 		sshterm.Point{Row: m.selection.cursor.row, Col: m.selection.cursor.col},
 	)
@@ -402,6 +419,25 @@ func (m *terminalModel) clearSelectionIfOutputChanged() bool {
 		return true
 	}
 	return false
+}
+
+func (m terminalModel) selectionPoint(app *App, row, col int) terminalPoint {
+	if m.term == nil {
+		return terminalPoint{row: row, col: col}
+	}
+	_, h := app.RightSize()
+	return terminalPoint{row: m.term.Screen().ViewStart(h) + row, col: col}
+}
+
+func (m *terminalModel) scrollSelectionDrag(app *App) {
+	if !m.selection.selecting || m.selection.scroll == 0 || m.term == nil {
+		if m.selection.selecting {
+			m.selection.cursor = m.selectionPoint(app, m.selection.dragRow, m.selection.dragCol)
+		}
+		return
+	}
+	m.scroll(m.selection.scroll * terminalSelectionScrollStep)
+	m.selection.cursor = m.selectionPoint(app, m.selection.dragRow, m.selection.dragCol)
 }
 
 // scroll moves the terminal view by delta rows (positive = up into history).
@@ -449,6 +485,7 @@ func (m terminalModel) View(app *App) string {
 	w, h := app.RightSize()
 	screen := m.term.Screen()
 	view := screen.View(h)
+	viewStart := screen.ViewStart(h)
 	curRow, curCol := screen.CursorInView(h)
 	var b strings.Builder
 	for r := 0; r < h; r++ {
@@ -461,7 +498,7 @@ func (m terminalModel) View(app *App) string {
 		if r == curRow && curCol >= 0 && curCol < w {
 			cursorCol = curCol
 		}
-		selStart, selEnd := m.selectionRangeForRow(r)
+		selStart, selEnd := m.selectionRangeForRow(viewStart + r)
 		s := renderRow(row, w, cursorCol, selStart, selEnd)
 		b.WriteString(s)
 		b.WriteString("\n")

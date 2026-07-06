@@ -2,6 +2,7 @@ package ui
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -69,6 +70,31 @@ func TestTerminalMouseWheelScrollsLocally(t *testing.T) {
 
 	if off := screen.ScrollOffset(); off != 3 {
 		t.Fatalf("scroll offset = %d, want 3", off)
+	}
+}
+
+func TestTerminalMouseWheelKeepsSelection(t *testing.T) {
+	clip := &fakeClipboard{}
+	app, screen := newMouseTerminalApp(t, clip)
+	for i := 0; i < 40; i++ {
+		screen.Print('x', sshterm.Style{})
+		screen.CarriageReturn()
+		screen.LineFeed()
+	}
+	_, h := app.RightSize()
+	_ = screen.View(h)
+
+	sendTerminalMouse(app, tea.MouseButtonLeft, tea.MouseActionPress, 0, 0)
+	sendTerminalMouse(app, tea.MouseButtonLeft, tea.MouseActionRelease, 4, 0)
+	sendTerminalMouse(app, tea.MouseButtonWheelUp, tea.MouseActionPress, 0, 0)
+
+	if !app.terminal.hasSelection() {
+		t.Fatal("wheel scrolling should keep selection")
+	}
+
+	sendTerminalMouse(app, tea.MouseButtonRight, tea.MouseActionPress, 4, 0)
+	if clip.copied == "" {
+		t.Fatal("selection was not copied after wheel scroll")
 	}
 }
 
@@ -165,6 +191,51 @@ func TestTerminalCtrlCCopiesSelectionInsteadOfInterrupt(t *testing.T) {
 	}
 }
 
+func TestTerminalBareCtrlKeepsSelection(t *testing.T) {
+	for _, msg := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune{0}},
+		{Type: tea.KeyNull},
+	} {
+		app, _ := newMouseTerminalApp(t, &fakeClipboard{})
+		var wrote []byte
+		app.terminal.writeInput = func(input []byte) error {
+			wrote = append(wrote, input...)
+			return nil
+		}
+
+		sendTerminalMouse(app, tea.MouseButtonLeft, tea.MouseActionPress, 0, 0)
+		sendTerminalMouse(app, tea.MouseButtonLeft, tea.MouseActionRelease, 4, 0)
+		_, _ = app.Update(msg)
+
+		if !app.terminal.hasSelection() {
+			t.Fatalf("%v cleared selection, want selection kept", msg.Type)
+		}
+		if len(wrote) != 0 {
+			t.Fatalf("%v wrote %q to PTY, want no bytes", msg.Type, string(wrote))
+		}
+	}
+}
+
+func TestTerminalTypingClearsSelection(t *testing.T) {
+	app, _ := newMouseTerminalApp(t, &fakeClipboard{})
+	var wrote []byte
+	app.terminal.writeInput = func(input []byte) error {
+		wrote = append(wrote, input...)
+		return nil
+	}
+
+	sendTerminalMouse(app, tea.MouseButtonLeft, tea.MouseActionPress, 0, 0)
+	sendTerminalMouse(app, tea.MouseButtonLeft, tea.MouseActionRelease, 4, 0)
+	_, _ = app.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+
+	if app.terminal.hasSelection() {
+		t.Fatal("typing should clear selection")
+	}
+	if string(wrote) != "x" {
+		t.Fatalf("typed bytes = %q, want x", string(wrote))
+	}
+}
+
 func TestTerminalRightPasteWhenNoSelection(t *testing.T) {
 	clip := &fakeClipboard{paste: "a\r\nb"}
 	app, _ := newMouseTerminalApp(t, clip)
@@ -218,5 +289,49 @@ func TestTerminalRightPasteReportsClipboardError(t *testing.T) {
 
 	if !strings.Contains(app.err, "missing clipboard") {
 		t.Fatalf("err = %q, want clipboard error", app.err)
+	}
+}
+
+func TestTerminalDragSelectionAboveViewScrollsIntoHistory(t *testing.T) {
+	clip := &fakeClipboard{}
+	app := New(Options{Clipboard: clip})
+	app.view = viewMain
+	app.right = rightTerminal
+	app.focus = focusRight
+	app.width, app.height = 100, 10
+
+	screen := sshterm.NewScreen(8)
+	for i := 0; i < 20; i++ {
+		for _, r := range fmt.Sprintf("L%02d", i) {
+			screen.Print(r, sshterm.Style{})
+		}
+		screen.CarriageReturn()
+		screen.LineFeed()
+	}
+	app.terminal = terminalModel{term: sshterm.NewTerminalWithScreen(screen)}
+
+	_, h := app.RightSize()
+	_ = screen.View(h)
+	initialStart := screen.ViewStart(h)
+	anchorRow := h - 2 // avoid the trailing blank line at the live bottom
+	anchorAbs := initialStart + anchorRow
+
+	sendTerminalMouse(app, tea.MouseButtonLeft, tea.MouseActionPress, 2, anchorRow)
+	sendTerminalMouse(app, tea.MouseButtonLeft, tea.MouseActionMotion, 0, -1)
+	for i := 0; i < 4; i++ {
+		_, _ = app.Update(terminalRefreshMsg{})
+	}
+	if screen.ScrollOffset() == 0 {
+		t.Fatal("dragging above the terminal did not scroll into history")
+	}
+	newStart := screen.ViewStart(h)
+	sendTerminalMouse(app, tea.MouseButtonNone, tea.MouseActionRelease, 0, -1)
+	_, _ = app.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+
+	if !strings.Contains(clip.copied, fmt.Sprintf("L%02d", newStart)) {
+		t.Fatalf("copied selection %q does not include scrolled history row L%02d", clip.copied, newStart)
+	}
+	if !strings.Contains(clip.copied, fmt.Sprintf("L%02d", anchorAbs)) {
+		t.Fatalf("copied selection %q does not include anchor row L%02d", clip.copied, anchorAbs)
 	}
 }

@@ -22,17 +22,6 @@ curl -fsSL https://raw.githubusercontent.com/bulanzade/xcx/main/install.sh | sh
 iwr -useb https://raw.githubusercontent.com/bulanzade/xcx/main/install.ps1 | iex
 ```
 
-### 升级 / 强制重装
-
-重新运行上面的安装命令即可升级。已是最新版本会自动跳过;强制重装(忽略版本对比):
-
-```bash
-# Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/bulanzade/xcx/main/install.sh | sh -s -- --force
-# Windows
-& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/bulanzade/xcx/main/install.ps1).Content)) -Force
-```
-
 ### 卸载
 
 卸载只删除安装脚本放置的二进制和回滚备份,不会删除 `~/.config/xcx/` 或 `%AppData%\xcx\` 中的 vault 与 known_hosts。

@@ -26,6 +26,19 @@ func TestTextRangeReverseAndClamp(t *testing.T) {
 	}
 }
 
+func TestTextRangeAbs(t *testing.T) {
+	s := NewScreen(5)
+	p := NewParser(s)
+	p.Write([]byte("AAAAA\r\nBBBBB\r\nCCCCC"))
+	_ = s.View(1)
+	s.Scroll(1)
+
+	got := s.TextRangeAbs(Point{Row: 0, Col: 1}, Point{Row: 2, Col: 2})
+	if got != "AAAA\nBBBBB\nCCC" {
+		t.Fatalf("TextRangeAbs = %q, want absolute rows independent of view", got)
+	}
+}
+
 func TestTextRangeTrimsLineRightPadding(t *testing.T) {
 	s := NewScreen(8)
 	p := NewParser(s)
