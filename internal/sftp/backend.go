@@ -101,8 +101,14 @@ type RemoteBackend struct {
 }
 
 // NewRemoteBackend opens the SFTP subsystem on c and returns a Backend.
+//
+// UseConcurrentWrites enables pkg/sftp's concurrent write pipeline so uploads
+// reach the same throughput as the sftp CLI (dozens of in-flight SSH_FXP_WRITE
+// requests filling the latency pipe). Without it, *sftp.File.ReadFrom falls
+// back to one synchronous write per chunk and uploads are dominated by per-packet
+// round-trip latency.
 func NewRemoteBackend(c *ssh.Client) (*RemoteBackend, error) {
-	sc, err := sftppkg.NewClient(c)
+	sc, err := sftppkg.NewClient(c, sftppkg.UseConcurrentWrites(true))
 	if err != nil {
 		return nil, err
 	}
