@@ -118,6 +118,12 @@ func NewRemoteBackend(c *ssh.Client) (*RemoteBackend, error) {
 // Close releases the underlying SFTP client.
 func (r *RemoteBackend) Close() error { return r.c.Close() }
 
+// Getwd returns the SFTP server's current working directory.
+func (r *RemoteBackend) Getwd() (string, error) { return r.c.Getwd() }
+
+// RealPath asks the server to canonicalize a remote path.
+func (r *RemoteBackend) RealPath(name string) (string, error) { return r.c.RealPath(name) }
+
 func (r *RemoteBackend) ReadDir(dir string) ([]Entry, error) {
 	infos, err := r.c.ReadDir(dir)
 	if err != nil {

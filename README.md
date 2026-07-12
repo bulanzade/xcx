@@ -1,5 +1,7 @@
 # xcx — TUI SSH 连接管理工具
 
+中文 | [English](README.en.md)
+
 一个终端(TUI)SSH 连接管理器,左侧常驻主机树,右侧显示终端/SFTP/占位面板。主机配置以 AES-256-GCM 加密保存,用主密码解锁。
 
 ## 安装

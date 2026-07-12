@@ -72,3 +72,75 @@ func TestOSC_NoResponderStillConsumed(t *testing.T) {
 		t.Fatalf("OSC leaked with no responder: %q", got)
 	}
 }
+
+func TestOSC7TracksCurrentDirectory(t *testing.T) {
+	s := NewScreen(40)
+	p := NewParser(s)
+
+	p.Write([]byte("\x1b]7;file://server/srv/my%20app\x1b\\"))
+	if got, want := s.CurrentDir(), "/srv/my app"; got != want {
+		t.Fatalf("CurrentDir() = %q, want %q", got, want)
+	}
+}
+
+func TestOSCCurrentDirectoryCompatibility(t *testing.T) {
+	tests := []struct {
+		name string
+		osc  string
+		want string
+	}{
+		{name: "Ubuntu Bash title", osc: "0;root@server: ~/项目", want: "~/项目"},
+		{name: "ConEmu", osc: "9;9;/opt/my%20app", want: "/opt/my app"},
+		{name: "Windows path", osc: "9;9;C:%5CUsers%5Croot", want: `C:\Users\root`},
+		{name: "iTerm", osc: "1337;CurrentDir=/var/lib/app", want: "/var/lib/app"},
+		{name: "VS Code", osc: "633;P;Cwd=/home/root/src", want: "/home/root/src"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewScreen(40)
+			p := NewParser(s)
+			p.Write([]byte("\x1b]" + tt.osc + "\x07"))
+			if got := s.CurrentDir(); got != tt.want {
+				t.Fatalf("CurrentDir() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnrelatedTitleDoesNotReplaceCurrentDirectory(t *testing.T) {
+	s := NewScreen(40)
+	p := NewParser(s)
+	p.Write([]byte("\x1b]7;file://server/srv/app\x07"))
+	p.Write([]byte("\x1b]0;README.md - VIM\x07"))
+
+	if got, want := s.CurrentDir(), "/srv/app"; got != want {
+		t.Fatalf("CurrentDir() = %q after unrelated title, want %q", got, want)
+	}
+}
+
+func TestPromptDirTracksCurrentShellPrompt(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		user string
+		want string
+	}{
+		{name: "root", line: "root@server:/srv/app# ", user: "root", want: "/srv/app"},
+		{name: "home relative", line: "alice@server:~/src$ ", user: "alice", want: "~/src"},
+		{name: "typed command", line: "root@server:/opt/api# git status", user: "root", want: "/opt/api"},
+		{name: "Windows prompt", line: `root@server: C:\Users\root# `, user: "root", want: `C:\Users\root`},
+		{name: "unrelated output", line: "root@server reported an error", user: "root", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewScreen(80)
+			p := NewParser(s)
+			p.Write([]byte(tt.line))
+			if got := s.PromptDir(tt.user); got != tt.want {
+				t.Fatalf("PromptDir(%q) = %q, want %q", tt.user, got, tt.want)
+			}
+		})
+	}
+}

@@ -1,7 +1,9 @@
 package sshterm
 
 import (
+	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"unicode/utf8"
 )
@@ -149,10 +151,10 @@ func (p *Parser) handleRune(r rune) {
 	case stOSCESC:
 		// We saw ESC inside an OSC; '\' completes ST and ends the sequence.
 		// Anything else also ends it (treat ESC as a hard reset to escape).
-		p.oscBuf = p.oscBuf[:0]
 		if r == '\\' {
-			p.state = stGround
+			p.finishOSC()
 		} else {
+			p.oscBuf = p.oscBuf[:0]
 			p.state = stEscape
 			p.handleEscape(r)
 		}
@@ -233,7 +235,7 @@ func (p *Parser) handleOSC(r rune) {
 	case r == 0x1b: // ESC: start of ST (ESC \)
 		p.state = stOSCESC
 	default:
-		p.oscBuf = append(p.oscBuf, byte(r))
+		p.oscBuf = utf8.AppendRune(p.oscBuf, r)
 	}
 }
 
@@ -242,6 +244,9 @@ func (p *Parser) finishOSC() {
 	body := p.oscBuf
 	p.oscBuf = p.oscBuf[:0]
 	p.state = stGround
+	if dir := currentDirFromOSC(string(body)); dir != "" {
+		p.screen.SetCurrentDir(dir)
+	}
 	if p.respond == nil {
 		return
 	}
@@ -256,6 +261,66 @@ func (p *Parser) finishOSC() {
 	case hasOSCParam(body, "12;?"):
 		p.respond([]byte("\x1b]12;rgb:0000/0000/0000\x1b\\"))
 	}
+}
+
+// currentDirFromOSC extracts shell working-directory reports. OSC 7 is the
+// standard form. The additional forms cover common shell integrations, while
+// OSC 0/2 handles Ubuntu's default Bash title ("user@host: ~/path").
+func currentDirFromOSC(body string) string {
+	switch {
+	case strings.HasPrefix(body, "7;"):
+		u, err := url.Parse(strings.TrimPrefix(body, "7;"))
+		if err != nil || u.Scheme != "file" {
+			return ""
+		}
+		return unescapeReportedDir(u.EscapedPath())
+	case strings.HasPrefix(body, "9;9;"):
+		return unescapeReportedDir(strings.TrimPrefix(body, "9;9;"))
+	case strings.HasPrefix(body, "1337;CurrentDir="):
+		return unescapeReportedDir(strings.TrimPrefix(body, "1337;CurrentDir="))
+	case strings.HasPrefix(body, "633;P;Cwd="):
+		return unescapeReportedDir(strings.TrimPrefix(body, "633;P;Cwd="))
+	case strings.HasPrefix(body, "0;") || strings.HasPrefix(body, "2;"):
+		return currentDirFromShellTitle(body[2:])
+	default:
+		return ""
+	}
+}
+
+func unescapeReportedDir(raw string) string {
+	dir, err := url.PathUnescape(raw)
+	if err != nil {
+		return ""
+	}
+	return validRemoteDir(dir)
+}
+
+func validRemoteDir(dir string) string {
+	if dir == "" || strings.ContainsRune(dir, '\x00') || !looksLikeRemoteDir(dir) {
+		return ""
+	}
+	return dir
+}
+
+func looksLikeRemoteDir(dir string) bool {
+	if strings.HasPrefix(dir, "/") || dir == "~" || strings.HasPrefix(dir, "~/") {
+		return true
+	}
+	return len(dir) >= 3 && ((dir[0] >= 'A' && dir[0] <= 'Z') || (dir[0] >= 'a' && dir[0] <= 'z')) &&
+		dir[1] == ':' && (dir[2] == '/' || dir[2] == '\\')
+}
+
+func currentDirFromShellTitle(title string) string {
+	at := strings.IndexByte(title, '@')
+	if at < 0 {
+		return ""
+	}
+	afterUser := title[at+1:]
+	separator := strings.Index(afterUser, ": ")
+	if separator < 0 {
+		return ""
+	}
+	return validRemoteDir(strings.TrimSpace(afterUser[separator+2:]))
 }
 
 // hasOSCParam reports whether the OSC payload body begins with prefix.

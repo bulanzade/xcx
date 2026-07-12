@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -77,7 +78,7 @@ type sftpModel struct {
 	remoteBk *sftp.RemoteBackend // non-nil when remote side is open
 }
 
-func newSFTPModel(app *App) (sftpModel, error) {
+func newSFTPModel(app *App, connKey string) (sftpModel, error) {
 	localPane, err := newLocalSFTPPane()
 	if err != nil {
 		return sftpModel{}, err
@@ -86,16 +87,41 @@ func newSFTPModel(app *App) (sftpModel, error) {
 	if err != nil {
 		return sftpModel{}, fmt.Errorf("open sftp: %w", err)
 	}
+	remoteDir := remoteStartDir(rb, app.remoteDirForKey(connKey))
 	remotePane := &pane{
 		backend:  rb,
-		cwd:      ".",
+		cwd:      remoteDir,
 		selected: map[string]bool{},
 	}
-	if err := remotePane.refresh(); err != nil {
+	err = remotePane.refresh()
+	if err != nil && remoteDir != "." {
+		// A shell can report a directory that was removed or became
+		// inaccessible before SFTP opens. Fall back to the server default so a
+		// stale terminal report does not prevent the panel from opening.
+		remotePane.cwd = "."
+		err = remotePane.refresh()
+	}
+	if err != nil {
 		_ = rb.Close()
 		return sftpModel{}, fmt.Errorf("list remote: %w", err)
 	}
 	return sftpModel{local: localPane, remote: remotePane, focused: localPane, remoteBk: rb}, nil
+}
+
+func remoteStartDir(rb *sftp.RemoteBackend, reported string) string {
+	if reported == "" {
+		return "."
+	}
+	candidate := reported
+	if reported == "~" || strings.HasPrefix(reported, "~/") {
+		if home, err := rb.Getwd(); err == nil && home != "" {
+			candidate = path.Join(home, strings.TrimPrefix(reported, "~"))
+		}
+	}
+	if resolved, err := rb.RealPath(candidate); err == nil && resolved != "" {
+		return resolved
+	}
+	return candidate
 }
 
 func newLocalSFTPPane() (*pane, error) {

@@ -117,6 +117,25 @@ func (t *Terminal) Start(ctx context.Context) {
 // concurrently with the running read loop.
 func (t *Terminal) Screen() *Screen { return t.screen }
 
+// CurrentDir returns the remote shell working directory most recently
+// reported through terminal integration. It is empty until the shell emits a
+// supported OSC sequence or title.
+func (t *Terminal) CurrentDir() string {
+	if t == nil || t.screen == nil {
+		return ""
+	}
+	return t.screen.CurrentDir()
+}
+
+// PromptDir returns a working directory inferred from a conventional shell
+// prompt currently under the cursor.
+func (t *Terminal) PromptDir(user string) string {
+	if t == nil || t.screen == nil {
+		return ""
+	}
+	return t.screen.PromptDir(user)
+}
+
 // BracketedPaste reports whether pasted input should be wrapped in xterm's
 // bracketed paste markers for the remote program.
 func (t *Terminal) BracketedPaste() bool {

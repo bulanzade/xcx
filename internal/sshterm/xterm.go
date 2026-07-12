@@ -1,6 +1,9 @@
 package sshterm
 
-import "sync/atomic"
+import (
+	"strings"
+	"sync/atomic"
+)
 
 // Screen is a minimal character grid that emulates the subset of xterm
 // behavior needed for interactive shells: writing printable text, line
@@ -13,6 +16,12 @@ import "sync/atomic"
 type Screen struct {
 	cols int
 	rows [][]Cell
+
+	// currentDir is the remote shell working directory most recently reported
+	// through terminal integration (OSC 7 and compatible sequences). It is
+	// atomic because the parser updates it in the PTY read loop while the UI
+	// reads it when opening SFTP.
+	currentDir atomic.Pointer[string]
 
 	// cursor position; row may exceed len(rows)-1 conceptually but rendering
 	// only shows the bottom `height` rows.
@@ -271,6 +280,61 @@ func (s *Screen) ScrollOffset() int { return s.scrollOff }
 // UI selections are anchored to visible coordinates, so callers can use this to
 // invalidate selections before copying stale coordinates from a shifted view.
 func (s *Screen) OutputVersion() uint64 { return s.outputVersion.Load() }
+
+// CurrentDir returns the remote shell working directory reported by terminal
+// integration. An empty string means the shell has not reported one yet.
+func (s *Screen) CurrentDir() string {
+	dir := s.currentDir.Load()
+	if dir == nil {
+		return ""
+	}
+	return *dir
+}
+
+// PromptDir extracts a working directory from a conventional shell prompt on
+// the cursor row, for example "root@server:/srv/app# ". This is a fallback for
+// shells that never emit OSC 7 or only emit it once at login.
+func (s *Screen) PromptDir(user string) string {
+	if user == "" || s.curRow < 0 || s.curRow >= len(s.rows) {
+		return ""
+	}
+	line := string(cellsText(s.rows[s.curRow], 0, s.cols-1))
+	return promptDir(line, user)
+}
+
+func promptDir(line, user string) string {
+	identity := user + "@"
+	identityAt := strings.LastIndex(line, identity)
+	if identityAt < 0 {
+		return ""
+	}
+	afterIdentity := line[identityAt+len(identity):]
+	colon := strings.IndexByte(afterIdentity, ':')
+	if colon < 0 {
+		return ""
+	}
+	rest := strings.TrimLeft(afterIdentity[colon+1:], " \t")
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case '#', '$', '%':
+			if i == len(rest)-1 || rest[i+1] == ' ' {
+				return validRemoteDir(strings.TrimSpace(rest[:i]))
+			}
+		}
+	}
+	return ""
+}
+
+// SetCurrentDir records a remote shell working directory. The parser calls
+// this for OSC current-directory sequences; it is exported so Screen-backed
+// terminal tests can model a shell that already reported its directory.
+func (s *Screen) SetCurrentDir(dir string) {
+	if dir == "" {
+		return
+	}
+	value := dir
+	s.currentDir.Store(&value)
+}
 
 // MarkOutput records that remote output changed the backing screen.
 func (s *Screen) MarkOutput() { s.outputVersion.Add(1) }

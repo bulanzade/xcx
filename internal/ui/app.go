@@ -636,13 +636,14 @@ func (a *App) openSFTPFromTerminal() {
 	if a.sess == nil {
 		return
 	}
-	sm, err := newSFTPModel(a)
+	key := a.currentHostKey()
+	sm, err := newSFTPModel(a, key)
 	if err != nil {
 		a.err = fmt.Sprintf("sftp: %v", err)
 		return
 	}
 	a.sftp = sm
-	a.activeSFTPKey = a.currentHostKey()
+	a.activeSFTPKey = key
 	a.right = rightSFTP
 	a.focus = focusRight
 }
@@ -797,6 +798,42 @@ func (a *App) currentHostKey() string {
 		return hostConnKey(a.sess.Host)
 	}
 	return ""
+}
+
+// remoteDirForKey returns the best known working directory for a connection.
+func (a *App) remoteDirForKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	a.ensureSessionMaps()
+
+	sess := a.sessions[key]
+	terminal := a.terminals[key]
+	if key == a.activeHostKey {
+		if a.sess != nil {
+			sess = a.sess
+		}
+		if a.terminal.term != nil {
+			terminal = a.terminal
+		}
+	}
+	if terminal.term == nil {
+		return ""
+	}
+	user := ""
+	if sess != nil && sess.Host != nil {
+		user = sess.Host.User
+	}
+	return terminalRemoteDir(terminal.term, user)
+}
+
+func terminalRemoteDir(term *sshterm.Terminal, user string) string {
+	// The live prompt wins over OSC because some shells report OSC only at
+	// login, leaving a stale "~" after later cd commands.
+	if dir := term.PromptDir(user); dir != "" {
+		return dir
+	}
+	return term.CurrentDir()
 }
 
 func (a *App) sessionForHost(h *vault.Host) *session.Session {

@@ -170,7 +170,7 @@ func (m hostTreeModel) openSFTP(app *App) (hostTreeModel, tea.Cmd) {
 	if sess := app.sessionForKey(host, connKey); sess != nil {
 		oldSess := app.sess
 		app.sess = sess
-		sm, err := newSFTPModel(app)
+		sm, err := newSFTPModel(app, connKey)
 		if err != nil {
 			app.sess = oldSess
 			app.err = fmt.Sprintf("sftp: %v", err)
@@ -232,7 +232,7 @@ func (a *App) handleDialResult(msg dialResultMsg) tea.Cmd {
 			a.activeHostKey = msg.key
 			a.ensureSessionMaps()
 			a.sessions[a.activeHostKey] = msg.sess
-			sm, err := newSFTPModel(a)
+			sm, err := newSFTPModel(a, msg.key)
 			if err != nil {
 				a.sess = oldSess
 				if oldSess != nil && oldSess.Host != nil {

@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"xcx/internal/session"
+	"xcx/internal/sshterm"
 	"xcx/internal/vault"
 )
 
@@ -290,6 +291,25 @@ func TestRightSizeSubtractsTerminalBorder(t *testing.T) {
 	w, h := app.RightSize()
 	if w != 61 || h != 37 {
 		t.Fatalf("RightSize terminal = %dx%d, want 61x37", w, h)
+	}
+}
+
+func TestRemoteDirForKeyUsesBackgroundTerminal(t *testing.T) {
+	app := New(Options{})
+	screen := sshterm.NewScreen(80)
+	screen.SetCurrentDir("~")
+	sshterm.NewParser(screen).Write([]byte("root@server:/srv/background# "))
+	term := sshterm.NewTerminalWithScreen(screen)
+	host := &vault.Host{User: "root"}
+	app.terminals = map[string]terminalModel{
+		"host-key": {term: term},
+	}
+	app.sessions = map[string]*session.Session{
+		"host-key": {Host: host},
+	}
+
+	if got, want := app.remoteDirForKey("host-key"), "/srv/background"; got != want {
+		t.Fatalf("remoteDirForKey() = %q, want %q", got, want)
 	}
 }
 
