@@ -30,7 +30,7 @@ func TestTextRangeAbs(t *testing.T) {
 	s := NewScreen(5)
 	p := NewParser(s)
 	p.Write([]byte("AAAAA\r\nBBBBB\r\nCCCCC"))
-	_ = s.View(1)
+	s.SetHeight(1)
 	s.Scroll(1)
 
 	got := s.TextRangeAbs(Point{Row: 0, Col: 1}, Point{Row: 2, Col: 2})
@@ -62,5 +62,25 @@ func TestParserTracksBracketedPaste(t *testing.T) {
 	p.Write([]byte("\x1b[?2004l"))
 	if p.BracketedPaste() {
 		t.Fatal("bracketed paste was not disabled")
+	}
+}
+
+// TestParserTracksApplicationCursor verifies DECCKM (?1h/?1l) is tracked. vim
+// and other full-screen programs set application cursor keys so their arrow
+// keys arrive as ESC O A/B/C/D; the UI must then forward arrows in the
+// application encoding instead of scrolling locally.
+func TestParserTracksApplicationCursor(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	if p.ApplicationCursor() {
+		t.Fatal("application cursor should default off (normal shell)")
+	}
+	p.Write([]byte("\x1b[?1h"))
+	if !p.ApplicationCursor() {
+		t.Fatal("application cursor was not enabled by ?1h")
+	}
+	p.Write([]byte("\x1b[?1l"))
+	if p.ApplicationCursor() {
+		t.Fatal("application cursor was not disabled by ?1l")
 	}
 }

@@ -22,7 +22,7 @@ func TestLineEdit_DeleteCharMidLine(t *testing.T) {
 	p.Write([]byte("\x1b[D")) // left onto 'l'
 	p.Write([]byte("\x1b[P")) // DCH: delete char at col 7
 
-	got := rowText(s.rows[0])
+	got := rowText(screenRows(s)[0])
 	if got != "docker og" {
 		t.Fatalf("after DCH delete: row0 = %q, want \"docker og\"", got)
 	}
@@ -36,7 +36,7 @@ func TestLineEdit_DCH_shiftsAndBlanksTail(t *testing.T) {
 	p.Write([]byte("abcde"))   // fill the row
 	p.Write([]byte("\x1b[2G")) // cursor to col 1 (0-based) -> on 'b'
 	p.Write([]byte("\x1b[P"))  // delete 'b' -> "acde" + blank
-	got := rowText(s.rows[0])
+	got := rowText(screenRows(s)[0])
 	if got != "acde" {
 		t.Fatalf("DCH result = %q, want \"acde\" (no duplicate e)", got)
 	}
@@ -50,7 +50,7 @@ func TestLineEdit_ECH_blanksAtCursor(t *testing.T) {
 	p.Write([]byte("abcdefgh"))
 	p.Write([]byte("\x1b[3G")) // cursor to col 2 (0-based) -> on 'c'
 	p.Write([]byte("\x1b[2X")) // erase 2 chars -> "ab__efgh"
-	got := rowText(s.rows[0])
+	got := rowText(screenRows(s)[0])
 	if got != "ab  efgh" {
 		t.Fatalf("ECH result = %q, want \"ab  efgh\"", got)
 	}
@@ -63,7 +63,7 @@ func TestLineEdit_ICH_insertsBlanks(t *testing.T) {
 	p.Write([]byte("abc"))
 	p.Write([]byte("\x1b[1G")) // cursor to col 0 -> on 'a'
 	p.Write([]byte("\x1b[@"))  // insert 1 char -> "_abc____"
-	got := rowText(s.rows[0])
+	got := rowText(screenRows(s)[0])
 	if got != " abc" {
 		t.Fatalf("ICH result = %q, want \" abc\"", got)
 	}

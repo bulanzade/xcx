@@ -131,9 +131,9 @@ func TestScroll_NoDeadZoneAtTop(t *testing.T) {
 	if maxOff != 6 {
 		t.Fatalf("maxOff = %d, want 6 (total=%d)", maxOff, total)
 	}
-	// Render once so the screen knows its view height (the UI renders every
-	// frame before any user scroll can arrive).
-	_ = s.View(h)
+	// Seed the terminal height so the scroll clamp is tight (View no longer
+	// seeds it; a real terminal sets it via resize before any scroll arrives).
+	s.SetHeight(h)
 
 	// Scroll way past the top.
 	s.Scroll(100)

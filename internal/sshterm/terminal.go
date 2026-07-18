@@ -85,6 +85,11 @@ func NewTerminal(sess PtySession, width, height int) (*Terminal, error) {
 		return nil, fmt.Errorf("sshterm: start shell: %w", err)
 	}
 	screen := NewScreen(width)
+	// Seed the screen with the PTY height so an alternate-screen switch
+	// (ESC [ ? 1049 h) before the first render sizes the alt viewport
+	// correctly, instead of clamping it to 1 row (NewScreen doesn't know the
+	// height; SetHeight also records it as the main buffer's scroll clamp).
+	screen.SetHeight(height)
 	t := &Terminal{
 		sess:   sess,
 		screen: screen,
@@ -117,6 +122,16 @@ func (t *Terminal) Start(ctx context.Context) {
 // concurrently with the running read loop.
 func (t *Terminal) Screen() *Screen { return t.screen }
 
+// FeedOutput parses b as if it arrived from the remote PTY, updating the
+// screen and mode-tracking state (DECCKM, bracketed paste, etc.). It is the
+// synchronous equivalent of the readLoop's parser.Write, intended for tests
+// that need to drive the terminal into a specific mode without a live session.
+func (t *Terminal) FeedOutput(b []byte) {
+	if t.parser != nil {
+		t.parser.Write(b)
+	}
+}
+
 // CurrentDir returns the remote shell working directory most recently
 // reported through terminal integration. It is empty until the shell emits a
 // supported OSC sequence or title.
@@ -142,12 +157,22 @@ func (t *Terminal) BracketedPaste() bool {
 	return t.parser != nil && t.parser.BracketedPaste()
 }
 
+// ApplicationCursor reports whether the remote program enabled DECCKM
+// application cursor keys (e.g. vim/less). When true, arrow keys must be sent
+// in the application encoding (ESC O A/B/C/D), and Shift+arrow keys belong to
+// the remote program rather than local scroll-back.
+func (t *Terminal) ApplicationCursor() bool {
+	return t.parser != nil && t.parser.ApplicationCursor()
+}
+
 // NewTerminalWithScreen builds a Terminal that has no live PTY but owns the
 // given Screen. It is intended for tests that exercise the Screen-backed
 // helpers (Scroll, View, rendering) without standing up a real SSH session.
-// The read loop is not started.
+// The read loop is not started. A parser is attached so mode-tracking helpers
+// (BracketedPaste, ApplicationCursor) work when tests feed escape sequences
+// directly via the parser.
 func NewTerminalWithScreen(screen *Screen) *Terminal {
-	return &Terminal{screen: screen}
+	return &Terminal{screen: screen, parser: NewParser(screen)}
 }
 
 // Scroll moves the terminal view by delta rows within scrollback (positive =
@@ -175,6 +200,12 @@ func (t *Terminal) Resize(width, height int) error {
 	t.mu.Lock()
 	t.width, t.height = width, height
 	t.mu.Unlock()
+	// Keep the screen's buffers in sync with the PTY height: the alt buffer is a
+	// fixed-height viewport, and the main buffer uses the height as its scroll
+	// clamp ceiling.
+	if t.screen != nil {
+		t.screen.SetHeight(height)
+	}
 	return t.sess.WindowChange(height, width)
 }
 

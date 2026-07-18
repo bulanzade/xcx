@@ -13,6 +13,7 @@ func TestParse_TopStyleRedraw(t *testing.T) {
 
 	// A representative top redraw payload, led by the charset sequence that
 	// was leaking. Each region line is preceded by ESC ( B in real top output.
+	s.SetHeight(5) // establish terminal height before the alt-screen switch
 	payload := []byte(
 		"\x1b[?1049h\x1b[?25l" + // alt screen + hide cursor
 			"\x1b(H" + // ESC ( H is also a charset sequence (just a different final byte)
@@ -95,7 +96,7 @@ func TestParse_CharsetSelection(t *testing.T) {
 		s := NewScreen(20)
 		p := NewParser(s)
 		p.Write([]byte(seq))
-		got := rowText(s.rows[0])
+		got := rowText(screenRows(s)[0])
 		// Every case ends with literal text 'X' (or nothing). No 'B'/'0'/'G'
 		// final bytes should leak.
 		wantNoLeak := ""

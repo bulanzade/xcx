@@ -26,18 +26,21 @@ func rowText(row []Cell) string {
 
 // screenLines returns the trimmed text of every row.
 func screenLines(s *Screen) []string {
-	out := make([]string, 0, s.Rows())
-	for r := 0; r < s.Rows(); r++ {
-		out = append(out, rowText(s.rows[r]))
+	rows := screenRows(s)
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowText(row))
 	}
 	return out
 }
+
+func screenRows(s *Screen) [][]Cell { return s.View(s.Rows()) }
 
 func TestParse_PlainText(t *testing.T) {
 	s := NewScreen(20)
 	p := NewParser(s)
 	p.Write([]byte("hello"))
-	if got := rowText(s.rows[0]); got != "hello" {
+	if got := rowText(screenRows(s)[0]); got != "hello" {
 		t.Fatalf("row0 = %q, want hello", got)
 	}
 	r, c := s.Cursor()
@@ -61,10 +64,10 @@ func TestParse_LineWrap(t *testing.T) {
 	s := NewScreen(5)
 	p := NewParser(s)
 	p.Write([]byte("abcdef")) // 6 chars into width 5 -> wraps
-	if got := rowText(s.rows[0]); got != "abcde" {
+	if got := rowText(screenRows(s)[0]); got != "abcde" {
 		t.Fatalf("row0 = %q, want abcde", got)
 	}
-	if got := rowText(s.rows[1]); got != "f" {
+	if got := rowText(screenRows(s)[1]); got != "f" {
 		t.Fatalf("row1 = %q, want f", got)
 	}
 }
@@ -73,7 +76,7 @@ func TestParse_Backspace(t *testing.T) {
 	s := NewScreen(20)
 	p := NewParser(s)
 	p.Write([]byte("abc\x08X")) // backspace then overwrite c with X
-	if got := rowText(s.rows[0]); got != "abX" {
+	if got := rowText(screenRows(s)[0]); got != "abX" {
 		t.Fatalf("row0 = %q, want abX", got)
 	}
 }
@@ -87,7 +90,7 @@ func TestParse_Tab(t *testing.T) {
 	if r != 0 || c != 9 {
 		t.Fatalf("cursor = (%d,%d), want (0,9)", r, c)
 	}
-	if ch := s.rows[0][8].Ch; ch != 'b' {
+	if ch := screenRows(s)[0][8].Ch; ch != 'b' {
 		t.Fatalf("char at col 8 = %q, want b", ch)
 	}
 }
@@ -99,7 +102,7 @@ func TestParse_CSI_ClearLine(t *testing.T) {
 	// move cursor to col 5 ("hello") then clear to end of line: "hello"
 	p.Write([]byte("\x1b[5G")) // CSI 5 G = cursor to column 5 (1-based) -> col 4
 	p.Write([]byte("\x1b[K"))  // CSI K = erase cursor to end of line
-	if got := rowText(s.rows[0]); got != "hell" {
+	if got := rowText(screenRows(s)[0]); got != "hell" {
 		t.Fatalf("row0 = %q, want hell", got)
 	}
 }
@@ -110,7 +113,7 @@ func TestParse_CSI_ClearScreen(t *testing.T) {
 	p.Write([]byte("line1\r\nline2\r\nline3"))
 	p.Write([]byte("\x1b[2J")) // clear entire screen
 	for r := 0; r < s.Rows(); r++ {
-		if got := rowText(s.rows[r]); got != "" {
+		if got := rowText(screenRows(s)[r]); got != "" {
 			t.Fatalf("row %d not cleared: %q", r, got)
 		}
 	}
@@ -203,10 +206,10 @@ func TestParse_SGR_Style(t *testing.T) {
 	p := NewParser(s)
 	// ESC[1m bold, write X, ESC[0m reset, write Y
 	p.Write([]byte("\x1b[1mX\x1b[0mY"))
-	if !s.rows[0][0].Style.Bold {
+	if !screenRows(s)[0][0].Style.Bold {
 		t.Fatal("X should be bold")
 	}
-	if s.rows[0][1].Style.Bold {
+	if screenRows(s)[0][1].Style.Bold {
 		t.Fatal("Y should not be bold")
 	}
 }
@@ -216,7 +219,7 @@ func TestParse_SGR_Colors(t *testing.T) {
 	p := NewParser(s)
 	// ESC[31m red fg, ESC[42m green bg
 	p.Write([]byte("\x1b[31;42mA"))
-	st := s.rows[0][0].Style
+	st := screenRows(s)[0][0].Style
 	if st.Fg != 1 { // ANSI 30+x maps to code x (1=red)
 		t.Fatalf("fg = %d, want 1 (red)", st.Fg)
 	}
@@ -230,7 +233,7 @@ func TestParse_IgnoresUnknownCSI(t *testing.T) {
 	p := NewParser(s)
 	// Unknown CSI should be consumed without breaking subsequent text.
 	p.Write([]byte("a\x1b[99Za"))
-	if got := rowText(s.rows[0]); got != "aa" {
+	if got := rowText(screenRows(s)[0]); got != "aa" {
 		t.Fatalf("row0 = %q, want aa", got)
 	}
 }
@@ -247,7 +250,7 @@ func TestParse_PrivateModeSequences(t *testing.T) {
 	// is that "2004h"/"2004l" do NOT appear in the rendered row; the prompt
 	// text itself is preserved verbatim.
 	p.Write([]byte("\x1b[?2004hroot@host:~#\x1b[?2004l"))
-	got := rowText(s.rows[0])
+	got := rowText(screenRows(s)[0])
 	if got != "root@host:~#" {
 		t.Fatalf("row0 = %q, want %q (private sequences leaked)", got, "root@host:~#")
 	}
@@ -272,7 +275,7 @@ func TestParse_CommonDECModes(t *testing.T) {
 		s := NewScreen(20)
 		p := NewParser(s)
 		p.Write([]byte(seq + "X"))
-		if got := rowText(s.rows[0]); got != "X" {
+		if got := rowText(screenRows(s)[0]); got != "X" {
 			t.Errorf("after %q row0 = %q, want X (sequence leaked)", seq, got)
 		}
 	}
@@ -284,11 +287,11 @@ func TestParse_PrivateThenPublic(t *testing.T) {
 	s := NewScreen(20)
 	p := NewParser(s)
 	p.Write([]byte("\x1b[?2004h\x1b[1mB\x1b[0m"))
-	got := rowText(s.rows[0])
+	got := rowText(screenRows(s)[0])
 	if got != "B" {
 		t.Fatalf("row0 = %q, want B", got)
 	}
-	if !s.rows[0][0].Style.Bold {
+	if !screenRows(s)[0][0].Style.Bold {
 		t.Fatal("B should be bold — public SGR after private sequence was mis-parsed")
 	}
 }
@@ -297,7 +300,7 @@ func TestParse_UTF8(t *testing.T) {
 	s := NewScreen(20)
 	p := NewParser(s)
 	p.Write([]byte("héllo")) // é is 2 bytes in UTF-8
-	if got := rowText(s.rows[0]); got != "héllo" {
+	if got := rowText(screenRows(s)[0]); got != "héllo" {
 		t.Fatalf("row0 = %q, want héllo", got)
 	}
 	r, c := s.Cursor()

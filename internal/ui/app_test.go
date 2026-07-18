@@ -39,11 +39,22 @@ func TestEncodeKey(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := string(encodeKey(c.msg))
+			got := string(encodeKey(c.msg, false))
 			if got != c.want {
 				t.Fatalf("encodeKey = %q, want %q", got, c.want)
 			}
 		})
+	}
+	for _, c := range []struct {
+		msg  tea.KeyMsg
+		want string
+	}{
+		{tea.KeyMsg{Type: tea.KeyUp}, "\x1bOA"},
+		{tea.KeyMsg{Type: tea.KeyDown}, "\x1bOB"},
+	} {
+		if got := string(encodeKey(c.msg, true)); got != c.want {
+			t.Fatalf("application cursor encodeKey = %q, want %q", got, c.want)
+		}
 	}
 }
 
@@ -58,14 +69,14 @@ func TestEncodeKey(t *testing.T) {
 func TestEncodeKey_WindowsLoneCtrlNoNUL(t *testing.T) {
 	// Several lone-Ctrl presses, each as a KeyRunes with a NUL rune.
 	for i := 0; i < 16; i++ {
-		got := encodeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{0}})
+		got := encodeKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{0}}, false)
 		if len(got) != 0 {
 			t.Fatalf("press %d: encodeKey produced %q, want no bytes (NUL must not reach PTY)", i, got)
 		}
 	}
 	// The Unix equivalent (KeyNull / KeyCtrlAt from a real 0x00 byte) must
 	// also not inject a NUL for a bare Ctrl press.
-	if got := encodeKey(tea.KeyMsg{Type: tea.KeyNull}); len(got) != 0 {
+	if got := encodeKey(tea.KeyMsg{Type: tea.KeyNull}, false); len(got) != 0 {
 		t.Fatalf("KeyNull encoded to %q, want no bytes", got)
 	}
 }

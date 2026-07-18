@@ -66,9 +66,10 @@ func TestVimJumpKeys_G_G(t *testing.T) {
 	app.focus = focusRight
 	app.width, app.height = 100, 40
 	screen := newTerminalWithScrollback(app, 60)
-	// Render once so the screen knows its view height (tightens the clamp).
+	// Seed the terminal height so the scroll clamp is tight (View no longer
+	// seeds it; a real terminal sets it via resize).
 	_, h := app.RightSize()
-	_ = screen.View(h)
+	screen.SetHeight(h)
 	maxOff := screen.Rows() - h // top-most reachable offset given this view height
 
 	// Enter scrollback, then 'G' must NOT jump to bottom — we're already

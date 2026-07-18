@@ -40,7 +40,8 @@ type Parser struct {
 	// oscBuf accumulates the payload of an in-progress OSC sequence.
 	oscBuf []byte
 
-	bracketedPaste atomic.Bool
+	bracketedPaste    atomic.Bool
+	applicationCursor atomic.Bool
 }
 
 // Responder is the interface for sending response bytes back to the remote
@@ -56,6 +57,15 @@ func (p *Parser) SetResponder(r func(b []byte)) { p.respond = r }
 // BracketedPaste reports whether the remote program currently requested
 // bracketed paste mode via CSI ? 2004 h/l.
 func (p *Parser) BracketedPaste() bool { return p.bracketedPaste.Load() }
+
+// ApplicationCursor reports whether the remote program enabled DECCKM
+// application cursor keys (CSI ? 1 h). When on, arrow keys must be sent in the
+// application encoding (ESC O A/B/C/D), not the normal-cursor encoding
+// (ESC [ A/B/C/D). vim/less/man turn this on so their arrow keys work; a bare
+// shell leaves it off. It also gates our local Shift+arrow scroll-back: in
+// application mode those keys belong to the remote program (bubbletea decodes
+// ESC O A/B as KeyShiftUp/Down), so we must forward them instead of scrolling.
+func (p *Parser) ApplicationCursor() bool { return p.applicationCursor.Load() }
 
 type parseState int
 
@@ -423,17 +433,23 @@ func (p *Parser) dispatchCSI(final rune) {
 		}
 	}
 
-	// Private sequences (CSI ? ... h/l, e.g. bracketed paste ?2004h, cursor
-	// visibility ?25h, alt screen ?1049h) must be fully consumed so their
-	// digits don't leak as visible text. We don't act on them in this MVP, so
-	// just drop the whole sequence.
+	// Private sequences (CSI ? ... h/l). Act on ?1/?47/?1047/?1049/?2004;
+	// drop the rest (e.g. ?25 cursor visibility, ?6 origin mode) fully so their
+	// digits don't leak as text.
 	if p.private != 0 {
-		if p.private == '?' && len(p.params) > 0 && p.params[0] == 2004 {
-			switch final {
-			case 'h':
-				p.bracketedPaste.Store(true)
-			case 'l':
-				p.bracketedPaste.Store(false)
+		if p.private == '?' && len(p.params) > 0 && (final == 'h' || final == 'l') {
+			enabled := final == 'h'
+			switch p.params[0] {
+			case 1: // DECCKM: application cursor keys on/off.
+				p.applicationCursor.Store(enabled)
+			case 47, 1047, 1049: // alternate screen (?1049 cursor save/restore not implemented).
+				if enabled {
+					p.screen.EnterAltScreen()
+				} else {
+					p.screen.LeaveAltScreen()
+				}
+			case 2004: // bracketed paste mode.
+				p.bracketedPaste.Store(enabled)
 			}
 		}
 		return
@@ -452,9 +468,11 @@ func (p *Parser) dispatchCSI(final rune) {
 	case 'D': // left
 		p.screen.MoveCursor(0, -p.param(0, 1))
 	case 'G', '`': // cursor to column
-		p.screen.SetCursor(p.screen.curRow, p.param(0, 1)-1)
+		curRow, _ := p.screen.Cursor()
+		p.screen.SetCursor(curRow, p.param(0, 1)-1)
 	case 'd': // cursor to row
-		p.screen.SetCursor(p.param(0, 1)-1, p.screen.curCol)
+		_, curCol := p.screen.Cursor()
+		p.screen.SetCursor(p.param(0, 1)-1, curCol)
 	case 'J': // erase display
 		p.screen.ClearScreen(p.param(0, 0))
 	case 'K': // erase line
@@ -465,10 +483,20 @@ func (p *Parser) dispatchCSI(final rune) {
 		p.screen.InsertChars(p.param(0, 1))
 	case 'X': // erase chars (ECH)
 		p.screen.EraseChars(p.param(0, 1))
+	case 'r': // DECSTBM scroll region: CSI Pt ; Pb r (1-based, inclusive).
+		p.screen.SetScrollRegion(p.param(0, 1)-1, p.param(1, p.screen.Rows())-1)
+	case 'L': // insert lines (IL)
+		p.screen.InsertLines(p.param(0, 1))
+	case 'M': // delete lines (DL)
+		p.screen.DeleteLines(p.param(0, 1))
+	case 'S': // scroll up (SU)
+		p.screen.ScrollRegionUp(p.param(0, 1))
+	case 'T': // scroll down (SD)
+		p.screen.ScrollRegionDown(p.param(0, 1))
 	case 'm': // SGR
 		p.applySGR()
 	default:
-		// ignore: h/l (modes), ? privates, r (scroll region), etc.
+		// ignore: h/l (modes), s/u (cursor save/restore), etc.
 	}
 }
 

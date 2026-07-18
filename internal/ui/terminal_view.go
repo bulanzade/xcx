@@ -204,10 +204,27 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 			app.openSFTPFromTerminal()
 			return m, nil
 		case tea.KeyShiftUp:
+			// bubbletea decodes vim's application-cursor arrow key ESC O A as
+			// KeyShiftUp. In application cursor mode the key belongs to the
+			// remote program (vim/less/man navigation) and must be forwarded in
+			// the application encoding; only in the normal shell do we use it
+			// for scroll-back.
+			if m.applicationCursor() {
+				if err := m.write([]byte{0x1b, 'O', 'A'}); err != nil {
+					app.err = fmt.Sprintf("write: %v", err)
+				}
+				return m, nil
+			}
 			m.clearSelection()
 			m.scroll(1)
 			return m, nil
 		case tea.KeyShiftDown:
+			if m.applicationCursor() {
+				if err := m.write([]byte{0x1b, 'O', 'B'}); err != nil {
+					app.err = fmt.Sprintf("write: %v", err)
+				}
+				return m, nil
+			}
 			m.clearSelection()
 			m.scroll(-1)
 			return m, nil
@@ -248,7 +265,7 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 				}
 			}
 		}
-		input := encodeKey(msg)
+		input := encodeKey(msg, m.applicationCursor())
 		if len(input) == 0 {
 			return m, nil
 		}
@@ -456,6 +473,13 @@ func (m terminalModel) scrolledBack() bool {
 	return m.term != nil && m.term.Screen().ScrollOffset() > 0
 }
 
+// applicationCursor reports whether the remote program enabled DECCKM
+// application cursor keys (vim/less/man). When true, arrow keys must be
+// forwarded to the remote program rather than used for local scroll-back.
+func (m terminalModel) applicationCursor() bool {
+	return m.term != nil && m.term.ApplicationCursor()
+}
+
 // jumpTop scrolls the view to the very top of scrollback.
 func (m terminalModel) jumpTop() {
 	if m.term != nil {
@@ -548,8 +572,11 @@ func (m *terminalModel) close() {
 }
 
 // encodeKey converts a bubbletea KeyMsg into the byte sequence the remote PTY
-// expects (xterm input encoding for control/function/arrow keys).
-func encodeKey(k tea.KeyMsg) []byte {
+// expects (xterm input encoding for control/function/arrow keys). When
+// appCursor is true the remote program enabled DECCKM application cursor keys
+// (e.g. vim), so arrow keys are emitted in the application encoding (ESC O A)
+// rather than the normal-cursor encoding (ESC [ A) — otherwise vim ignores them.
+func encodeKey(k tea.KeyMsg, appCursor bool) []byte {
 	// Plain runes: send as-is (UTF-8), but drop C0 control bytes that arrive as
 	// runes on Windows. Windows reports a lone Ctrl press (and some Ctrl+key
 	// combos that have no dedicated control code) as KeyRunes with a NUL
@@ -583,14 +610,16 @@ func encodeKey(k tea.KeyMsg) []byte {
 	case tea.KeyEsc:
 		return []byte{0x1b}
 	case tea.KeyUp:
-		return []byte{0x1b, '[', 'A'}
+		return arrowKey(appCursor, 'A')
 	case tea.KeyDown:
-		return []byte{0x1b, '[', 'B'}
+		return arrowKey(appCursor, 'B')
 	case tea.KeyRight:
-		return []byte{0x1b, '[', 'C'}
+		return arrowKey(appCursor, 'C')
 	case tea.KeyLeft:
-		return []byte{0x1b, '[', 'D'}
+		return arrowKey(appCursor, 'D')
 	case tea.KeyHome:
+		// Home/End don't have a separate application-mode encoding in common
+		// use; keep the normal-cursor sequence.
 		return []byte{0x1b, '[', 'H'}
 	case tea.KeyEnd:
 		return []byte{0x1b, '[', 'F'}
@@ -606,4 +635,14 @@ func encodeKey(k tea.KeyMsg) []byte {
 		return []byte{byte(k.Type - tea.KeyCtrlA + 1)}
 	}
 	return nil
+}
+
+// arrowKey returns the encoding for an arrow key (final byte A/B/C/D): ESC O x
+// in application-cursor mode (DECCKM on, e.g. vim), ESC [ x otherwise. Programs
+// that enable application cursor keys only recognize the ESC O form.
+func arrowKey(appCursor bool, final byte) []byte {
+	if appCursor {
+		return []byte{0x1b, 'O', final}
+	}
+	return []byte{0x1b, '[', final}
 }

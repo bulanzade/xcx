@@ -15,7 +15,7 @@ func TestOSC_ColorQueryNoLeak(t *testing.T) {
 	p := NewParser(s)
 	p.Write([]byte("\x1b]10;?\x07")) // OSC 10;? (fg) BEL
 	p.Write([]byte("\x1b]11;?\x07")) // OSC 11;? (bg) BEL
-	if got := rowText(s.rows[0]); got != "" {
+	if got := rowText(screenRows(s)[0]); got != "" {
 		t.Fatalf("OSC color queries leaked as text: %q, want empty", got)
 	}
 }
@@ -27,7 +27,7 @@ func TestOSC_STTerminator(t *testing.T) {
 	p := NewParser(s)
 	p.Write([]byte("\x1b]0;window-title\x1b\\")) // OSC 0 (set title), ST-terminated
 	p.Write([]byte("X"))
-	got := rowText(s.rows[0])
+	got := rowText(screenRows(s)[0])
 	if got != "X" {
 		t.Fatalf("after ST-terminated OSC row0 = %q, want \"X\" (OSC leaked)", got)
 	}
@@ -39,7 +39,7 @@ func TestOSC_FollowedByText(t *testing.T) {
 	s := NewScreen(40)
 	p := NewParser(s)
 	p.Write([]byte("\x1b]10;?\x07hello"))
-	if got := rowText(s.rows[0]); got != "hello" {
+	if got := rowText(screenRows(s)[0]); got != "hello" {
 		t.Fatalf("row0 = %q, want \"hello\"", got)
 	}
 }
@@ -68,7 +68,7 @@ func TestOSC_NoResponderStillConsumed(t *testing.T) {
 	s := NewScreen(40)
 	p := NewParser(s) // no responder
 	p.Write([]byte("\x1b]10;?\x07\x1b]11;?\x07\x1b]0;title\x07"))
-	if got := rowText(s.rows[0]); got != "" {
+	if got := rowText(screenRows(s)[0]); got != "" {
 		t.Fatalf("OSC leaked with no responder: %q", got)
 	}
 }

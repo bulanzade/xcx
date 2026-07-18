@@ -78,7 +78,7 @@ func TestDSR_NoResponderNoLeak(t *testing.T) {
 	s := NewScreen(40)
 	p := NewParser(s) // no SetResponder
 	p.Write([]byte("\x1b[6n\x1b[5n\x1b[c\x1b[>c"))
-	if got := rowText(s.rows[0]); got != "" {
+	if got := rowText(screenRows(s)[0]); got != "" {
 		t.Fatalf("queries leaked as text with no responder: %q", got)
 	}
 }
