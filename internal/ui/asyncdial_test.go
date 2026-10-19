@@ -1,14 +1,63 @@
 package ui
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"io"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/crypto/ssh"
 
 	"xcx/internal/session"
+	"xcx/internal/sshterm"
 	"xcx/internal/vault"
 )
+
+// fakeUIPtySession is a minimal sshterm.PtySession for UI-level tests that need
+// a real *sshterm.Terminal without an SSH server. It records the PTY request
+// and window-change sizes.
+type fakeUIPtySession struct {
+	stdin             *bytes.Buffer
+	term              string
+	ptyW, ptyH        int
+	winW, winH        int
+	shellStarted      bool
+	stdoutTakenBefore bool
+}
+
+type nopWriteCloser struct{ b *bytes.Buffer }
+
+func (c nopWriteCloser) Write(p []byte) (int, error) { return c.b.Write(p) }
+func (c nopWriteCloser) Close() error                { return nil }
+
+func (f *fakeUIPtySession) RequestPty(term string, h, w int, modes ssh.TerminalModes) error {
+	f.term, f.ptyH, f.ptyW = term, h, w
+	return nil
+}
+func (f *fakeUIPtySession) Setenv(name, value string) error { return nil }
+func (f *fakeUIPtySession) Shell() error {
+	f.shellStarted = true
+	return nil
+}
+func (f *fakeUIPtySession) WindowChange(h, w int) error {
+	f.winH, f.winW = h, w
+	return nil
+}
+func (f *fakeUIPtySession) StdinPipe() (io.WriteCloser, error) {
+	return nopWriteCloser{f.stdin}, nil
+}
+func (f *fakeUIPtySession) StdoutPipe() (io.Reader, error) {
+	if !f.stdoutTakenBefore {
+		f.stdoutTakenBefore = true
+		return bytes.NewBufferString(""), nil // EOF immediately
+	}
+	return nil, errors.New("ssh: Stdout already set")
+}
+func (f *fakeUIPtySession) StderrPipe() (io.Reader, error) { return &bytes.Buffer{}, nil }
+func (f *fakeUIPtySession) Wait() error                    { return nil }
+func (f *fakeUIPtySession) Close() error                   { return nil }
 
 // TestConnectHost_IsAsync is the regression test for the bug where connectHost
 // dialed synchronously inside Update, freezing the TUI on slow/unreachable
@@ -255,5 +304,82 @@ func TestShutdownClearsCachedSessionsAndTerminals(t *testing.T) {
 
 	if app.sess != nil || len(app.sessions) != 0 || len(app.terminals) != 0 {
 		t.Fatalf("shutdown left state: sess=%v sessions=%d terminals=%d", app.sess, len(app.sessions), len(app.terminals))
+	}
+}
+
+// TestTerminalStartedMsgSyncsPtyToPaneSize is the regression test for the
+// clipped-box bug: openTerminalCmd captures RightSize() while the right pane is
+// still the placeholder (no terminal border), and only terminalStartedMsg
+// switches app.right to rightTerminal — which shrinks RightSize by the pane
+// border. Without an immediate Resize the PTY stayed wider than the render
+// area, so full-width TUI boxes (pi's input box) lost their right edge.
+func TestTerminalStartedMsgSyncsPtyToPaneSize(t *testing.T) {
+	app := New(Options{})
+	app.view = viewMain
+	app.width, app.height = 100, 30
+	app.right = rightPlaceholder // as at dial time
+
+	// Simulate openTerminalCmd: the terminal is created at the
+	// placeholder-time size, before the pane switch.
+	captureW, captureH := app.RightSize()
+	fake := &fakeUIPtySession{stdin: &bytes.Buffer{}}
+	term, err := sshterm.NewTerminal(fake, captureW, captureH)
+	if err != nil {
+		t.Fatalf("NewTerminal: %v", err)
+	}
+	defer term.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	app.terminal, _ = app.terminal.Update(app, terminalStartedMsg{
+		sess:   &session.Session{Host: &vault.Host{Name: "h", Addr: "10.0.0.1", User: "u"}},
+		key:    "k",
+		term:   term,
+		ctx:    ctx,
+		cancel: cancel,
+	})
+
+	if app.right != rightTerminal {
+		t.Fatal("right pane not switched to terminal")
+	}
+	wantW, wantH := app.RightSize()
+	if wantW >= captureW || wantH >= captureH {
+		t.Fatalf("test setup: terminal pane size %dx%d did not shrink from capture %dx%d",
+			wantW, wantH, captureW, captureH)
+	}
+	if fake.winW != wantW || fake.winH != wantH {
+		t.Fatalf("PTY size after start = %dx%d, want %dx%d", fake.winW, fake.winH, wantW, wantH)
+	}
+	if cols := term.Screen().Cols(); cols != wantW {
+		t.Fatalf("screen cols after start = %d, want %d", cols, wantW)
+	}
+}
+
+// TestRestoreTerminalForKeyResizesPty pins the SFTP/host-tree → terminal
+// switch path: RightSize changes with the pane switch, and the restore must
+// re-sync the PTY to it (the backgrounded terminal missed WindowSizeMsgs).
+func TestRestoreTerminalForKeyResizesPty(t *testing.T) {
+	app := New(Options{})
+	app.view = viewMain
+	app.width, app.height = 100, 30
+	app.right = rightSFTP // terminal is backgrounded
+
+	fake := &fakeUIPtySession{stdin: &bytes.Buffer{}}
+	term, err := sshterm.NewTerminal(fake, 200, 60) // created at some older size
+	if err != nil {
+		t.Fatalf("NewTerminal: %v", err)
+	}
+	defer term.Close()
+	key := "restore-key"
+	app.ensureSessionMaps()
+	app.sessions[key] = &session.Session{Host: &vault.Host{Name: "h", Addr: "10.0.0.1", User: "u"}}
+	app.terminals[key] = terminalModel{term: term}
+
+	if !app.restoreTerminalForKey(app.sessions[key].Host, key) {
+		t.Fatal("restoreTerminalForKey returned false")
+	}
+	wantW, wantH := app.RightSize()
+	if fake.winW != wantW || fake.winH != wantH {
+		t.Fatalf("PTY size after restore = %dx%d, want %dx%d", fake.winW, fake.winH, wantW, wantH)
 	}
 }

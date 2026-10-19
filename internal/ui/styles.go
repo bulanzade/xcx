@@ -12,24 +12,26 @@ import (
 )
 
 // isDefaultStyle reports whether st is the "no styling" default (the parser
-// represents default fg/bg as -1). We avoid emitting escapes for such cells.
+// represents default fg/bg as ColorDefault). We avoid emitting escapes for such
+// cells.
 func isDefaultStyle(st sshterm.Style) bool {
-	return !st.Bold && !st.Dim && !st.Italic && !st.Under && !st.Rev && st.Fg < 0 && st.Bg < 0
+	return !st.Bold && !st.Dim && !st.Italic && !st.Under && !st.Rev && st.Fg == sshterm.ColorDefault && st.Bg == sshterm.ColorDefault
 }
 
 // sgrOn returns the CSI sequence that activates st. Returns "" for the default
-// style so plain text stays escape-free. Reverse video swaps fg/bg to match
-// how terminals render SGR 7m. We emit raw ANSI rather than going through
-// lipgloss here so styling is applied regardless of the active color profile
-// (lipgloss strips attributes under the Ascii profile used in tests/headless).
+// style so plain text stays escape-free. Style colors are re-emitted as the
+// original SGR parameters together with attribute codes; reverse video is
+// emitted as SGR 7 and the HOST terminal performs the fg/bg swap — swapping
+// here as well double-inverted Rev+color cells (ESC[7;31m showed red text
+// where xterm shows a red background). We emit raw ANSI rather than going
+// through lipgloss here so styling is applied regardless of the active color
+// profile (lipgloss strips attributes under the Ascii profile used in
+// tests/headless).
 func sgrOn(st sshterm.Style) string {
 	if isDefaultStyle(st) {
 		return ""
 	}
 	fg, bg := st.Fg, st.Bg
-	if st.Rev {
-		fg, bg = bg, fg
-	}
 	var codes []string
 	if st.Bold {
 		codes = append(codes, "1")
@@ -46,16 +48,33 @@ func sgrOn(st sshterm.Style) string {
 	if st.Rev {
 		codes = append(codes, "7")
 	}
-	if fg >= 0 && fg < 8 {
-		codes = append(codes, "3"+itoa(int(fg)))
+	if fg != sshterm.ColorDefault {
+		codes = append(codes, colorCode(fg, 30, 90, 38))
 	}
-	if bg >= 0 && bg < 8 {
-		codes = append(codes, "4"+itoa(int(bg)))
+	if bg != sshterm.ColorDefault {
+		codes = append(codes, colorCode(bg, 40, 100, 48))
 	}
 	if len(codes) == 0 {
 		return ""
 	}
 	return "\x1b[" + strings.Join(codes, ";") + "m"
+}
+
+// colorCode renders one Color as SGR parameter text: basic colors as 3x/4x,
+// bright as 9x/10x, palette indexes as ext;5;n, and direct colors as
+// ext;2;r;g;b (basic/bright/ext are the fg and bg variants of each form).
+func colorCode(c sshterm.Color, basic, bright, ext int) string {
+	switch {
+	case c < 8:
+		return itoa(basic + int(c))
+	case c < 16:
+		return itoa(bright + int(c) - 8)
+	case !c.IsRGB():
+		return itoa(ext) + ";5;" + itoa(c.PaletteIndex())
+	default:
+		r, g, b := c.RGB()
+		return itoa(ext) + ";2;" + itoa(r) + ";" + itoa(g) + ";" + itoa(b)
+	}
 }
 
 func itoa(i int) string {
@@ -72,12 +91,32 @@ func itoa(i int) string {
 	return string(buf[n:])
 }
 
+// cellWidth returns the display width of one remote-grid cell's rune in the
+// REMOTE program's coordinate system. East Asian Ambiguous characters
+// (box-drawing ─│╭, •, ±, …) count as a single column — matching how the
+// remote terminal and TUIs (pi, codex, vim) lay out their output. Plain
+// runewidth.RuneWidth flips ambiguous characters to two columns when the
+// LOCAL locale is zh/ja/ko, which halved pi's full-width input-box rules and
+// clipped right-aligned footer text on Chinese-locale hosts. Wide runes (CJK,
+// emoji) still take two columns.
+func cellWidth(r rune) int {
+	w := runewidth.RuneWidth(r)
+	if w == 2 && runewidth.IsAmbiguousWidth(r) {
+		return 1
+	}
+	if w < 1 {
+		return 1
+	}
+	return w
+}
+
 // renderRow turns one screen row into a styled string by emitting raw SGR
 // sequences. Consecutive cells with the same style are grouped into a single
-// span (open + text + reset) so we don't emit one escape per character. Blank
-// (Ch==0) cells are treated as spaces carrying the cell's style, so background
-// or reverse spans stay filled across the whole line width. Default-styled
-// cells are emitted as bare text (no escapes) to keep plain output clean.
+// span (open + text + reset) so we don't emit one escape per character.
+// Blank (Ch==0) cells are unwritten grid fillers; they render as plain spaces
+// with the terminal default style (never black-on-black padding), like a real
+// terminal's untouched cells. Default-styled cells are emitted as bare text
+// (no escapes) to keep plain output clean.
 //
 // cursorCol, when >= 0, marks the column of the terminal cursor on this row;
 // that cell is rendered with reverse video forced on so the cursor is visible
@@ -120,15 +159,19 @@ func renderRow(row []sshterm.Cell, width, cursorCol int, selection ...int) strin
 		if ch == 0 {
 			ch = ' '
 		}
-		chWidth := runewidth.RuneWidth(ch)
-		if chWidth < 1 {
-			chWidth = 1
-		}
+		chWidth := cellWidth(ch)
 		if used+chWidth > width {
 			ch = ' '
 			chWidth = width - used
 		}
 		st := cell.Style
+		if cell.Ch == 0 {
+			// Filler cells beyond written content are grid zero values
+			// (Fg:0/Bg:0 = black); they must render as plain blanks with the
+			// terminal default style, like a real terminal's unwritten cells —
+			// not black-on-black padding.
+			st = sshterm.Style{Fg: sshterm.ColorDefault, Bg: sshterm.ColorDefault}
+		}
 		if c == cursorCol {
 			// Render the cursor as a solid reverse-video block. We force the
 			// colors to default (terminal fg on bg) and reverse them, so the

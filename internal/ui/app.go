@@ -901,6 +901,13 @@ func (a *App) restoreTerminalForKey(h *vault.Host, key string) bool {
 	a.activeHostKey = key
 	a.right = rightTerminal
 	a.focus = focusRight
+	// RightSize() changed with the switch to rightTerminal (the terminal
+	// pane's border). Re-sync the PTY and screen to the corrected size so
+	// remote full-width UIs (pi's input box) line up with the render area.
+	if tm.term != nil {
+		tw, th := a.RightSize()
+		_ = tm.term.Resize(tw, th)
+	}
 	a.status = fmt.Sprintf("connected to %s", h.Name)
 	a.err = ""
 	return true

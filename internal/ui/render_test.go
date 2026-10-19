@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"xcx/internal/sshterm"
 )
@@ -157,6 +158,46 @@ func TestRender_TopReverseHeaderEndToEnd(t *testing.T) {
 	}
 }
 
+// TestRender_ExtendedColorEndToEnd is the full regression test for the
+// monochrome AI-agent bug: codex/pi style TUIs color their interface almost
+// exclusively with SGR 38;5;n (256-color) and 38;2;r;g;b (truecolor), which the
+// parser used to discard. The sequences must survive parser → screen →
+// renderer and be re-emitted to the host terminal.
+func TestRender_ExtendedColorEndToEnd(t *testing.T) {
+	screen := sshterm.NewScreen(40)
+	p := sshterm.NewParser(screen)
+	p.Write([]byte("\x1b[38;5;208magent\x1b[0m \x1b[38;2;255;100;0mprompt\x1b[0m"))
+
+	row := screen.View(1)[0]
+	got := renderRow(row, 40, -1)
+	if !strings.Contains(got, "agent") || !strings.Contains(got, "prompt") {
+		t.Fatalf("text missing: %q", got)
+	}
+	if !strings.Contains(got, "\x1b[38;5;208m") {
+		t.Fatalf("256-color SGR missing: %q", got)
+	}
+	if !strings.Contains(got, "\x1b[38;2;255;100;0m") {
+		t.Fatalf("truecolor SGR missing: %q", got)
+	}
+}
+
+// TestRenderRow_BrightAndExtended verifies the renderer maps bright palette
+// indexes (8-15) to the 9x/10x SGR form and palette 16-255 to ext;5;n, for
+// both foreground and background.
+func TestRenderRow_BrightAndExtended(t *testing.T) {
+	row := []sshterm.Cell{
+		{Ch: 'A', Style: sshterm.Style{Fg: 9, Bg: -1}},   // bright red fg -> 91
+		{Ch: 'B', Style: sshterm.Style{Fg: -1, Bg: 196}}, // palette bg -> 48;5;196
+	}
+	got := renderRow(row, 2, -1)
+	if !hasSGR(got, "91") {
+		t.Fatalf("bright-red fg SGR (CSI 91m) missing: %q", got)
+	}
+	if !strings.Contains(got, "48;5;196") {
+		t.Fatalf("256-color bg SGR missing: %q", got)
+	}
+}
+
 func TestRender_TopLocalizedHeaderKeepsReset(t *testing.T) {
 	screen := sshterm.NewScreen(12)
 	p := sshterm.NewParser(screen)
@@ -280,5 +321,82 @@ func TestRenderRow_CursorOnBlankGrid(t *testing.T) {
 	got := renderRow(nil, 5, 0)
 	if !strings.Contains(got, "\x1b[7m") {
 		t.Fatalf("cursor on blank row must emit a reverse span, got %q", got)
+	}
+}
+
+// TestRenderRow_AmbiguousWidthLocaleIndependent is the regression test for the
+// "pi input box shows only its left half" bug on Chinese-locale hosts: box
+// drawing characters (─) and bullets (•) are East Asian Ambiguous, which
+// go-runewidth counts as TWO columns when the local locale is zh/ja/ko. The
+// remote program laid those lines out one column per cell, so the renderer
+// must too — a full-width rule of 100 cells was cut to 50 and right-aligned
+// footer text was clipped. Forcing the CJK width mode here makes the test
+// fail on any locale without the fix.
+func TestRenderRow_AmbiguousWidthLocaleIndependent(t *testing.T) {
+	prev := runewidth.DefaultCondition.EastAsianWidth
+	runewidth.DefaultCondition.EastAsianWidth = true
+	defer func() { runewidth.DefaultCondition.EastAsianWidth = prev }()
+	if w := runewidth.RuneWidth('─'); w != 2 {
+		t.Fatalf("test setup: ─ measures %d columns under EastAsianWidth, want 2", w)
+	}
+
+	// A full-width rule (pi's input box border) must render every cell.
+	row := make([]sshterm.Cell, 100)
+	for i := range row {
+		row[i] = sshterm.Cell{Ch: '─', Style: sshterm.Style{Fg: 104}}
+	}
+	got := renderRow(row, 100, -1)
+	if n := strings.Count(got, "─"); n != 100 {
+		t.Fatalf("rendered %d of 100 box-drawing cells; ambiguous width halved the line", n)
+	}
+
+	// Right-aligned footer text after an ambiguous bullet must not be clipped.
+	text := strings.Repeat("a", 94) + " • " + "high"
+	row2 := make([]sshterm.Cell, len(text))
+	for i, ch := range text {
+		row2[i] = sshterm.Cell{Ch: ch, Style: sshterm.Style{Fg: -1, Bg: -1}}
+	}
+	got2 := renderRow(row2, len(text), -1)
+	if !strings.Contains(got2, "high") {
+		t.Fatalf("text after ambiguous-width bullet was clipped: %q", got2)
+	}
+
+	// Genuinely wide runes still take two columns (this is layout, not the bug).
+	row3 := []sshterm.Cell{{Ch: '漢', Style: sshterm.Style{Fg: -1, Bg: -1}}, defStyled('a'), defStyled('b')}
+	got3 := renderRow(row3, 3, -1)
+	if !strings.Contains(got3, "漢") || strings.Contains(got3, "ab") {
+		t.Fatalf("wide rune should consume two columns and clip the tail: %q", got3)
+	}
+}
+
+// TestRenderRow_ReverseKeepsColorParams is the regression test for the
+// double-inverted reverse video: sgrOn used to swap fg/bg itself AND emit
+// SGR 7, so the host terminal swapped again — ESC[7;31m (red background on
+// xterm) showed as red TEXT on a default background. The params must be
+// re-emitted as parsed; the host's SGR 7 performs the swap.
+func TestRenderRow_ReverseKeepsColorParams(t *testing.T) {
+	screen := sshterm.NewScreen(40)
+	p := sshterm.NewParser(screen)
+	p.Write([]byte("\x1b[7;31mX\x1b[0m"))
+
+	got := renderRow(screen.View(1)[0], 40, -1)
+	if !strings.Contains(got, "7;31") {
+		t.Fatalf("reverse+red must re-emit the parsed params 7;31: %q", got)
+	}
+	if strings.Contains(got, "7;41") || strings.Contains(got, "7;34") {
+		t.Fatalf("reverse video must not swap color params before emitting: %q", got)
+	}
+}
+
+// TestRenderRow_ZeroCellsRenderPlain pins the filler-cell rule: unwritten
+// grid cells (Ch==0 zero values) render as plain blanks, never the
+// black-on-black 30;40 padding they carried before.
+func TestRenderRow_ZeroCellsRenderPlain(t *testing.T) {
+	got := renderRow(make([]sshterm.Cell, 5), 5, -1)
+	if got != "     " {
+		t.Fatalf("zero-value row = %q, want five plain spaces", got)
+	}
+	if strings.Contains(got, "30;40") || strings.Contains(got, "\x1b") {
+		t.Fatalf("zero-value cells must not emit SGR: %q", got)
 	}
 }

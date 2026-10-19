@@ -228,6 +228,108 @@ func TestParse_SGR_Colors(t *testing.T) {
 	}
 }
 
+// TestParse_SGR_256Color is a regression test for the bug where SGR 38;5;n /
+// 48;5;n were consumed but never applied, rendering 256-color TUIs (codex, pi,
+// bubbletea apps) monochrome. Both forms must set real palette colors.
+func TestParse_SGR_256Color(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	p.Write([]byte("\x1b[38;5;196mA\x1b[48;5;21mB"))
+	st := screenRows(s)[0][0].Style
+	if st.Fg.IsRGB() || st.Fg.PaletteIndex() != 196 {
+		t.Fatalf("fg = %v, want palette 196", st.Fg)
+	}
+	st = screenRows(s)[0][1].Style
+	if st.Bg.IsRGB() || st.Bg.PaletteIndex() != 21 {
+		t.Fatalf("bg = %v, want palette 21", st.Bg)
+	}
+	if st.Fg.PaletteIndex() != 196 {
+		t.Fatalf("fg after bg change = %v, want palette 196", st.Fg)
+	}
+}
+
+// TestParse_SGR_TrueColor is a regression test for the bug where SGR 38;2;r;g;b
+// / 48;2;r;g;b (direct 24-bit color) were dropped, so truecolor interfaces lost
+// all color.
+func TestParse_SGR_TrueColor(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	p.Write([]byte("\x1b[38;2;255;100;0mA\x1b[48;2;1;2;3mB"))
+	st := screenRows(s)[0][0].Style
+	if !st.Fg.IsRGB() {
+		t.Fatalf("fg = %v, want direct RGB", st.Fg)
+	}
+	if r, g, b := st.Fg.RGB(); r != 255 || g != 100 || b != 0 {
+		t.Fatalf("fg rgb = (%d,%d,%d), want (255,100,0)", r, g, b)
+	}
+	st = screenRows(s)[0][1].Style
+	if r, g, b := st.Bg.RGB(); !st.Bg.IsRGB() || r != 1 || g != 2 || b != 3 {
+		t.Fatalf("bg rgb = (%d,%d,%d), want (1,2,3)", r, g, b)
+	}
+}
+
+// TestParse_SGR_BrightColors verifies aixterm bright codes 90-97/100-107 map
+// to palette indexes 8-15.
+func TestParse_SGR_BrightColors(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	p.Write([]byte("\x1b[91mA\x1b[103mB"))
+	st := screenRows(s)[0][0].Style
+	if st.Fg.PaletteIndex() != 9 || st.Fg.IsRGB() {
+		t.Fatalf("fg = %v, want palette 9 (bright red)", st.Fg)
+	}
+	st = screenRows(s)[0][1].Style
+	if st.Bg.PaletteIndex() != 11 || st.Bg.IsRGB() {
+		t.Fatalf("bg = %v, want palette 11 (bright yellow)", st.Bg)
+	}
+}
+
+// TestParse_SGR_ColonForm verifies the colon-separated SGR form (38:5:n) is
+// consumed as a sub-parameter list instead of aborting the sequence — before
+// the fix the parser reset on ':' and leaked "5:196m" as visible text.
+func TestParse_SGR_ColonForm(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	p.Write([]byte("\x1b[38:5:196mX"))
+	if got := rowText(screenRows(s)[0]); got != "X" {
+		t.Fatalf("row0 = %q, want X (no leaked digits)", got)
+	}
+	if fg := screenRows(s)[0][0].Style.Fg; fg.PaletteIndex() != 196 {
+		t.Fatalf("fg = %v, want palette 196", fg)
+	}
+}
+
+// TestParse_SGR_ExtendedMalformed verifies truncated/invalid extended-color
+// forms do not desync the parser: subsequent parameters in the same or
+// following sequences still apply.
+func TestParse_SGR_ExtendedMalformed(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	// 38 without a mode, 38;2 missing blue, 38;5;999 out of palette range.
+	p.Write([]byte("\x1b[38mA\x1b[38;2;255;0mB\x1b[38;5;999mC\x1b[31mD"))
+	if got := rowText(screenRows(s)[0]); got != "ABCD" {
+		t.Fatalf("row0 = %q, want ABCD", got)
+	}
+	if fg := screenRows(s)[0][3].Style.Fg; fg != 1 {
+		t.Fatalf("fg after malformed forms = %v, want 1 (red)", fg)
+	}
+}
+
+// TestParse_SGR_ExtendedReset verifies SGR 0 clears extended colors set via
+// 38;5 / 38;2 back to the terminal default.
+func TestParse_SGR_ExtendedReset(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	p.Write([]byte("\x1b[38;2;10;20;30mA\x1b[0mB"))
+	st := screenRows(s)[0][0].Style
+	if !st.Fg.IsRGB() {
+		t.Fatalf("fg before reset = %v, want RGB", st.Fg)
+	}
+	if fg := screenRows(s)[0][1].Style.Fg; fg != ColorDefault {
+		t.Fatalf("fg after reset = %v, want default", fg)
+	}
+}
+
 func TestParse_IgnoresUnknownCSI(t *testing.T) {
 	s := NewScreen(20)
 	p := NewParser(s)
@@ -306,5 +408,196 @@ func TestParse_UTF8(t *testing.T) {
 	r, c := s.Cursor()
 	if r != 0 || c != 5 {
 		t.Fatalf("cursor = (%d,%d), want (0,5)", r, c)
+	}
+}
+
+// TestParse_MouseReportingModes is the regression test for htop's mouse
+// support: htop enables reporting with the combined-parameter sequence
+// CSI ? 1006;1000 h, and the parser used to examine only the FIRST DEC mode
+// parameter — the 1000 tracking request was silently dropped, so mouse events
+// never reached the remote program. All modes must be tracked across
+// combined and separate sequences, and reset by their matching 'l'.
+func TestParse_MouseReportingModes(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+
+	p.Write([]byte("\x1b[?1006;1000h")) // htop's enable form
+	cfg := p.MouseConfig()
+	if !cfg.Reporting || !cfg.SGR || cfg.Motion != 0 {
+		t.Fatalf("after ?1006;1000h: cfg=%+v, want Reporting+SGR, no motion", cfg)
+	}
+
+	p.Write([]byte("\x1b[?1006;1000l")) // htop's disable form
+	if cfg = p.MouseConfig(); cfg.Reporting || cfg.SGR {
+		t.Fatalf("after reset: cfg=%+v, want reporting off", cfg)
+	}
+
+	p.Write([]byte("\x1b[?1003h")) // any-event tracking (vim/pi)
+	if cfg = p.MouseConfig(); cfg.Motion != 2 {
+		t.Fatalf("after ?1003h: Motion=%d, want 2", cfg.Motion)
+	}
+	p.Write([]byte("\x1b[?1003l"))
+	p.Write([]byte("\x1b[?1002h")) // button-event tracking
+	if cfg = p.MouseConfig(); cfg.Motion != 1 {
+		t.Fatalf("after ?1002h: Motion=%d, want 1", cfg.Motion)
+	}
+	p.Write([]byte("\x1b[?9h")) // X10 press-only
+	if cfg = p.MouseConfig(); !cfg.X10 {
+		t.Fatal("after ?9h: X10 not set")
+	}
+}
+
+// TestParse_MouseTrackingModesReplaceEachOther pins the tracking-mode group
+// semantics: ?9/?1000/?1002/?1003 select one protocol, not additive flags.
+// Enabling a mode replaces the active one; disabling clears reporting. As
+// additive bits, a stale ?1003 survived "enable ?1003, enable ?1000, disable
+// ?1000" and kept the pane swallowing the mouse after the remote program
+// turned reporting off. Encoding flags (?1006) stay independent of the group.
+func TestParse_MouseTrackingModesReplaceEachOther(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+
+	p.Write([]byte("\x1b[?1003h"))
+	if cfg := p.MouseConfig(); !cfg.Reporting || cfg.Motion != 2 {
+		t.Fatalf("after ?1003h: cfg=%+v, want Reporting with Motion=2", cfg)
+	}
+	p.Write([]byte("\x1b[?1000h")) // replaces ?1003
+	if cfg := p.MouseConfig(); !cfg.Reporting || cfg.Motion != 0 {
+		t.Fatalf("after ?1000h over ?1003: cfg=%+v, want Reporting with Motion=0", cfg)
+	}
+	p.Write([]byte("\x1b[?1000l")) // disabling the active mode clears the group
+	if cfg := p.MouseConfig(); cfg.Reporting {
+		t.Fatalf("after ?1000l: cfg=%+v, want reporting off", cfg)
+	}
+	p.Write([]byte("\x1b[?1006h\x1b[?1002h"))
+	if cfg := p.MouseConfig(); !cfg.SGR || cfg.Motion != 1 {
+		t.Fatalf("after ?1006h ?1002h: cfg=%+v, want SGR with Motion=1", cfg)
+	}
+}
+
+// TestParse_CombinedDECPrivateModes verifies every parameter of a multi-mode
+// CSI ? ... h sequence takes effect, not just the first one.
+func TestParse_CombinedDECPrivateModes(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	p.Write([]byte("\x1b[?2004;1h")) // bracketed paste + application cursor
+	if !p.BracketedPaste() {
+		t.Fatal("bracketed paste (param 2) was dropped from combined DEC mode set")
+	}
+	if !p.ApplicationCursor() {
+		t.Fatal("application cursor (param 1) was dropped from combined DEC mode set")
+	}
+	p.Write([]byte("\x1b[?1;2004l"))
+	if p.BracketedPaste() || p.ApplicationCursor() {
+		t.Fatal("combined DEC mode reset did not clear both modes")
+	}
+}
+
+// TestParse_SGR_SubParams pins the colon sub-parameter semantics: a
+// sub-parameter belongs to its owning code and must never be reinterpreted as
+// an independent SGR code. Before the sub-flag tracking, 4:3 (neovim's
+// undercurl) became underline+italic, 4:0 performed a full reset, kitty's
+// 38:2::r:g:b colorspace form computed a wrong color and let the trailing
+// channel clobber the style, and 58 underline-color arguments leaked as SGR
+// codes (flattening an empty slot to 0 = reset).
+func TestParse_SGR_SubParams(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	p.Write([]byte("\x1b[4:3mA\x1b[0m\x1b[4:0mB"))
+	stA := screenRows(s)[0][0].Style
+	if !stA.Under || stA.Italic {
+		t.Fatalf("4:3 -> %+v, want underline without italic", stA)
+	}
+	if stB := screenRows(s)[0][1].Style; stB.Under {
+		t.Fatalf("4:0 -> %+v, want underline off (not a full reset either)", stB)
+	}
+
+	// kitty colorspace form: the empty slot after :: is skipped, and the
+	// trailing blue channel does NOT leak as an SGR code.
+	s2 := NewScreen(20)
+	p2 := NewParser(s2)
+	p2.Write([]byte("\x1b[1m\x1b[38:2::10:20:30mX\x1b[0m\x1b[58:2::1:2:3mY"))
+	st := screenRows(s2)[0][0].Style
+	if r, g, b := st.Fg.RGB(); !st.Fg.IsRGB() || r != 10 || g != 20 || b != 30 {
+		t.Fatalf("38:2::10:20:30 fg = %v, want RGB(10,20,30)", st.Fg)
+	}
+	if !st.Bold {
+		t.Fatal("bold set before the colon sequence was lost")
+	}
+	stY := screenRows(s2)[0][1].Style
+	if stY.Fg != ColorDefault || stY.Bg != ColorDefault || stY.Dim {
+		t.Fatalf("58:2::… must not touch style (or reset it): %+v", stY)
+	}
+
+	// Semicolon forms are unaffected: 4;3 stays underline+italic.
+	s3 := NewScreen(20)
+	p3 := NewParser(s3)
+	p3.Write([]byte("\x1b[4;3mZ"))
+	if st := screenRows(s3)[0][0].Style; !st.Under || !st.Italic {
+		t.Fatalf("4;3 -> %+v, want underline AND italic", st)
+	}
+}
+
+// TestParse_SGR_ColorspaceGroupBoundary pins the colon-group boundary in the
+// truecolor parser: 38:2:0:128:64 holds only three group values, so those
+// are the channels — the colorspace slot is skipped only when the group
+// carries four values (colorspace + 3 channels). Reading past the group's
+// end used to swallow the following ';'-separated attribute, turning
+// ESC[38:2:0:128:64;1m into RGB(128,64,1) without bold instead of
+// RGB(0,128,64) with bold.
+func TestParse_SGR_ColorspaceGroupBoundary(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	p.Write([]byte("\x1b[38:2:0:128:64;1mX"))
+	st := screenRows(s)[0][0].Style
+	if r, g, b := st.Fg.RGB(); !st.Fg.IsRGB() || r != 0 || g != 128 || b != 64 {
+		t.Fatalf("38:2:0:128:64 fg = %v, want RGB(0,128,64)", st.Fg)
+	}
+	if !st.Bold {
+		t.Fatal("the ;1 after the color group was consumed; bold lost")
+	}
+
+	// A four-value group is the colorspace form: the leading slot is skipped.
+	s2 := NewScreen(20)
+	p2 := NewParser(s2)
+	p2.Write([]byte("\x1b[38:2:1:10:20:30mY"))
+	st2 := screenRows(s2)[0][0].Style
+	if r, g, b := st2.Fg.RGB(); !st2.Fg.IsRGB() || r != 10 || g != 20 || b != 30 {
+		t.Fatalf("38:2:1:10:20:30 fg = %v, want RGB(10,20,30) with colorspace 1 skipped", st2.Fg)
+	}
+}
+
+// TestParse_SGR_ExtendedCombinedWithAttributes verifies the extended-color
+// consumption indices when attributes and colors share one sequence — the
+// off-by-one-prone core of the color fix.
+func TestParse_SGR_ExtendedCombinedWithAttributes(t *testing.T) {
+	s := NewScreen(20)
+	p := NewParser(s)
+	p.Write([]byte("\x1b[1;38;2;10;20;30;4mX"))
+	st := screenRows(s)[0][0].Style
+	if !st.Bold || !st.Under || !st.Fg.IsRGB() {
+		t.Fatalf("1;38;2;10;20;30;4 -> %+v, want bold+underline+RGB", st)
+	}
+
+	s2 := NewScreen(20)
+	p2 := NewParser(s2)
+	p2.Write([]byte("\x1b[38;5;196;1mY"))
+	st2 := screenRows(s2)[0][0].Style
+	if !st2.Bold || st2.Fg.PaletteIndex() != 196 || st2.Fg.IsRGB() {
+		t.Fatalf("38;5;196;1 -> %+v, want bold + palette 196", st2)
+	}
+
+	// Truncated truecolor: missing channels default to 0 and are consumed —
+	// the leftover digits must not resurface as SGR codes (a stray 0 reset
+	// used to wipe previously-set attributes).
+	s3 := NewScreen(20)
+	p3 := NewParser(s3)
+	p3.Write([]byte("\x1b[1m\x1b[38;2;255;0mZ"))
+	st3 := screenRows(s3)[0][0].Style
+	if !st3.Bold {
+		t.Fatal("truncated 38;2;255;0 leaked a reset that cleared bold")
+	}
+	if r, g, b := st3.Fg.RGB(); !st3.Fg.IsRGB() || r != 255 || g != 0 || b != 0 {
+		t.Fatalf("truncated 38;2;255;0 fg = %v, want RGB(255,0,0)", st3.Fg)
 	}
 }

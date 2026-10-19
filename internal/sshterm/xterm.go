@@ -98,16 +98,63 @@ type Point struct {
 	Col int
 }
 
-// Style holds foreground/background color codes (16-color ANSI for MVP) plus
-// the bold/dim/italic/underline/reverse attributes. Zero value = default.
+// Style holds foreground/background colors plus the bold/dim/italic/underline/
+// reverse attributes. Zero value = default.
 type Style struct {
-	Fg     int8 // -1 = default
-	Bg     int8
+	Fg     Color
+	Bg     Color
 	Bold   bool
 	Dim    bool
 	Italic bool
 	Under  bool
 	Rev    bool
+}
+
+// Color encodes one terminal color:
+//
+//   - ColorDefault (-1): the terminal's default fg/bg,
+//   - 0..255: an xterm palette index (0-7 basic, 8-15 bright, 16-255 the
+//     256-color cube), as selected by SGR 30-37/90-97 or 38;5;n,
+//   - colorRGBBit|0xRRGGBB: a direct 24-bit color, as selected by SGR 38;2.
+//
+// The palette range deliberately shares the numeric space with the ANSI codes
+// (30+x maps to x, 90+x maps to x-90+8) so basic colors keep their index.
+type Color int32
+
+// ColorDefault is the terminal's default foreground/background color.
+const ColorDefault Color = -1
+
+// colorRGBBit marks a Color as a direct 24-bit value; the low 24 bits hold
+// 0xRRGGBB. It sits above the 0..255 palette range so the two never collide.
+const colorRGBBit Color = 1 << 24
+
+// PaletteColor returns the Color for xterm palette index n, clamped to 0..255.
+func PaletteColor(n int) Color {
+	if n < 0 {
+		n = 0
+	}
+	if n > 255 {
+		n = 255
+	}
+	return Color(n)
+}
+
+// RGBColor returns a direct 24-bit Color from 8-bit channels.
+func RGBColor(r, g, b int) Color {
+	return colorRGBBit | Color((r&0xff)<<16|(g&0xff)<<8|b&0xff)
+}
+
+// IsRGB reports whether c is a direct 24-bit color.
+func (c Color) IsRGB() bool { return c >= colorRGBBit }
+
+// PaletteIndex returns the palette index of a non-RGB, non-default color.
+func (c Color) PaletteIndex() int { return int(c) }
+
+// RGB returns the 8-bit channels of a direct color. Callers must check IsRGB
+// first; other colors return zeroes.
+func (c Color) RGB() (r, g, b int) {
+	v := int(c) & 0xffffff
+	return v >> 16 & 0xff, v >> 8 & 0xff, v & 0xff
 }
 
 // NewScreen creates a screen cols wide (height is dynamic; it exposes the
@@ -139,9 +186,13 @@ func newGrid(cols int, fixed bool, height int) *grid {
 	return g
 }
 
-// Cols returns the configured width. Width is immutable after construction,
-// so no lock is needed.
-func (s *Screen) Cols() int { return s.cols }
+// Cols returns the configured width. The width changes on terminal resize via
+// SetWidth, which holds mu; readers take the matching lock.
+func (s *Screen) Cols() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cols
+}
 
 // Rows returns the total number of rows in the active buffer.
 func (s *Screen) Rows() int {
@@ -157,13 +208,25 @@ func (s *Screen) Rows() int {
 // so content vim writes at the top stays visible instead of being pushed off
 // by placeholder lines below it.
 //
-// View also remembers the rendering height (the scroll clamp ceiling on main,
-// the fixed viewport height on alt). The returned slice aliases the grid's
-// storage; callers must finish rendering before the next screen mutation.
+// The returned slice is a copy of the row-header array made under the lock:
+// the grid's rows can be re-sliced by a concurrent SetWidth (different-length
+// headers in the same slots), and an aliasing view could observe a torn
+// header. The rows' cell contents are still shared; transient cell-level
+// tearing is tolerated as before (the UI re-renders at its own frame rate).
 func (s *Screen) View(height int) [][]Cell {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.active.view(height)
+	rows := s.active.view(height)
+	out := make([][]Cell, len(rows))
+	for i, row := range rows {
+		// Rows can carry a preserved tail beyond s.cols after a narrowing
+		// resize; the view contract is one row per cols-wide line.
+		if len(row) > s.cols {
+			row = row[:s.cols]
+		}
+		out[i] = row
+	}
+	return out
 }
 
 func (g *grid) view(height int) [][]Cell {
@@ -216,11 +279,11 @@ func (g *grid) viewStart(height int) int {
 // TextRange extracts plain text from the current visible window. Coordinates
 // are inclusive and are clamped to the visible window.
 func (s *Screen) TextRange(height int, start, end Point) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if height < 1 || s.cols < 1 {
 		return ""
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	view := s.active.view(height)
 	if len(view) == 0 {
 		return ""
@@ -521,7 +584,16 @@ func (g *grid) print(ch rune, style Style) {
 		g.curCol = 0
 		g.ensureRow(g.curRow)
 	}
-	g.rows[g.curRow][g.curCol] = Cell{Ch: ch, Style: style}
+	row := g.rows[g.curRow]
+	if len(row) > g.cols {
+		// A row wider than the grid was preserved by a narrowing resize; the
+		// program rewriting this line at the current width makes the
+		// clipped-out tail stale. Drop it instead of letting the rewrite
+		// concatenate with the old tail when the width grows back.
+		row = row[:g.cols]
+		g.rows[g.curRow] = row
+	}
+	row[g.curCol] = Cell{Ch: ch, Style: style}
 	g.curCol++
 	if g.curCol >= g.cols {
 		g.curCol = g.cols - 1
@@ -750,6 +822,11 @@ func (s *Screen) ClearLine(mode int) {
 			row[c] = blank
 		}
 	}
+	// "To end of line" (0) and "entire line" (2) also cover a preserved tail
+	// beyond g.cols.
+	if mode == 0 || mode == 2 {
+		g.clipTails(g.curRow, g.curRow+1)
+	}
 }
 
 // DeleteChars deletes n chars at the cursor, shifting the rest of the line
@@ -846,6 +923,8 @@ func (g *grid) clearScreen(mode int, cols int) {
 				g.rows[r][c] = blank
 			}
 		}
+		// Erase-to-end-of-screen also erases the preserved tails.
+		g.clipTails(g.curRow, len(g.rows))
 	case 1:
 		g.ensureRow(g.curRow)
 		for r := 0; r < g.curRow; r++ {
@@ -901,7 +980,9 @@ func (g *grid) ensureRow(r int) {
 }
 
 // rebuild unconditionally rebuilds the grid's rows at the given height, all
-// blank. Used when entering or resizing the alternate screen.
+// blank. Used when entering or resizing the alternate screen. The cursor row
+// is clamped to the new height so a stale position from a taller screen can't
+// index out of bounds on the next write.
 func (g *grid) rebuild(height int) {
 	if height < 1 {
 		height = 1
@@ -912,6 +993,13 @@ func (g *grid) rebuild(height int) {
 	}
 	g.rows = newRows
 	g.height = height
+	if g.curRow >= height {
+		g.curRow = height - 1
+	}
+	if g.curRow < 0 {
+		g.curRow = 0
+	}
+	g.pendingWrap = false
 }
 
 // EnterAltScreen switches to the alternate (fixed-height) buffer, sizing it to
@@ -1035,5 +1123,71 @@ func (s *Screen) SetHeight(h int) {
 	s.main.viewH = h
 	if s.alt.height != h {
 		s.alt.rebuild(h)
+	}
+}
+
+// SetWidth re-slices both buffers' rows to the new terminal width. Rows are
+// padded with blank cells when widening; when narrowing, cells beyond the new
+// width stay in storage and are clipped at display time, so history printed
+// at the old width survives the resize instead of being permanently
+// truncated. Cursor columns are clamped. This keeps the grid in lock-step
+// with the PTY width announced to the remote side: without it, programs that
+// redraw at the new width (pi, codex, vim after SIGWINCH) wrapped or clipped
+// against the stale grid width, which showed TUI boxes cut off mid-screen.
+func (s *Screen) SetWidth(cols int) {
+	if cols < 1 {
+		cols = 1
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cols == cols {
+		return
+	}
+	s.cols = cols
+	s.main.resizeWidth(cols)
+	s.alt.resizeWidth(cols)
+}
+
+// resizeWidth adapts the grid to a new terminal width. Widening pads rows
+// with blank cells. Narrowing does NOT truncate stored rows: cells beyond the
+// new width are kept and merely clipped at display time, so re-widening
+// restores lines printed before the shrink instead of showing permanently
+// truncated history. Rows that outlive the width that way are normalized back
+// to g.cols once the program rewrites or erases them (print, ClearLine,
+// clearScreen) — the tail is stale the moment the line is touched again.
+//
+// pendingWrap: at the old width the cursor sat one past the row's last cell
+// waiting to wrap; once the row is wider, that position is a real column
+// again. Advancing curCol before clearing the flag keeps the next printed
+// rune from overwriting the row's last character.
+func (g *grid) resizeWidth(cols int) {
+	widening := cols > g.cols
+	g.cols = cols
+	for i, row := range g.rows {
+		if len(row) >= cols {
+			continue // wide enough; a longer row keeps its preserved tail
+		}
+		padded := make([]Cell, cols)
+		copy(padded, row)
+		g.rows[i] = padded
+	}
+	if g.pendingWrap && widening {
+		g.curCol++
+	}
+	g.pendingWrap = false
+	if g.curCol >= cols {
+		g.curCol = cols - 1
+	}
+}
+
+// clipTails drops preserved cells beyond the grid width from rows
+// [from, to). Narrowing resizes keep those tails for history, but an explicit
+// erase (EL/ED) covers the whole stored line — leaving tails would resurrect
+// erased text when the width grows back.
+func (g *grid) clipTails(from, to int) {
+	for r := from; r < to && r < len(g.rows); r++ {
+		if len(g.rows[r]) > g.cols {
+			g.rows[r] = g.rows[r][:g.cols]
+		}
 	}
 }

@@ -53,7 +53,10 @@ func main() {
 	// Mouse reporting lets xcx own terminal-pane scrolling and selection.
 	// Native host-terminal selection is intercepted while this is enabled, so
 	// the app implements Windows Terminal-style left-select/right-copy-paste.
-	p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	// All-motion (?1003), not cell-motion: remote programs that enable
+	// any-event tracking only ever see real hover events when the host
+	// terminal delivers button-less motion to us.
+	p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithMouseAllMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "xcx: %v\n", err)
 		os.Exit(1)

@@ -15,6 +15,9 @@ import (
 // the concrete ssh.Session for its core loop).
 type PtySession interface {
 	RequestPty(term string, h, w int, modes ssh.TerminalModes) error
+	// Setenv requests a remote environment variable before Shell. Servers
+	// reject pairs outside sshd's AcceptEnv; callers treat it as best-effort.
+	Setenv(name, value string) error
 	Shell() error
 	WindowChange(h, w int) error
 	StdinPipe() (io.WriteCloser, error)
@@ -22,6 +25,24 @@ type PtySession interface {
 	StderrPipe() (io.Reader, error)
 	Wait() error
 	Close() error
+}
+
+// TerminalOption customizes terminal creation.
+type TerminalOption func(*terminalOptions)
+
+type terminalOptions struct {
+	env map[string]string
+}
+
+// WithEnv asks the remote shell to export name=value (best-effort; sshd's
+// AcceptEnv usually restricts what is accepted, failures are ignored).
+func WithEnv(name, value string) TerminalOption {
+	return func(o *terminalOptions) {
+		if o.env == nil {
+			o.env = map[string]string{}
+		}
+		o.env[name] = value
+	}
 }
 
 // Terminal drives an interactive remote shell: it requests a PTY, pumps
@@ -34,6 +55,11 @@ type Terminal struct {
 	parser *Parser
 
 	stdin io.WriteCloser
+	// writeMu serializes writes to stdin: input from the UI goroutine
+	// (keys, mouse events) races the read loop's query replies (DSR/DA/OSC
+	// responses), and the underlying ssh channel writer is not safe for
+	// concurrent use — interleaved writes corrupt each other's packets.
+	writeMu sync.Mutex
 	// out/err are obtained before Shell() starts the session: the SSH library
 	// forbids calling StdoutPipe/StderrPipe once Shell has run (it sets
 	// started=true). We stash them here so the read loop can use them.
@@ -55,7 +81,7 @@ type Terminal struct {
 // The pipes MUST be requested before Shell() (which flips the session's
 // started flag); doing it afterward makes StdoutPipe return
 // "ssh: StdoutPipe after process started" and the shell dies instantly.
-func NewTerminal(sess PtySession, width, height int) (*Terminal, error) {
+func NewTerminal(sess PtySession, width, height int, opts ...TerminalOption) (*Terminal, error) {
 	if width < 1 {
 		width = 1
 	}
@@ -74,12 +100,23 @@ func NewTerminal(sess PtySession, width, height int) (*Terminal, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sshterm: stderr pipe: %w", err)
 	}
-	if err := sess.RequestPty("xterm", height, width, ssh.TerminalModes{
+	// TERM=xterm-256color: with plain "xterm" (8 colors), remote programs that
+	// probe terminfo (htop, codex, pi/lipgloss) downgrade their palette to the
+	// basic 8/16 colors or none at all. The 256-color terminfo entry ships with
+	// every modern ncurses installation.
+	if err := sess.RequestPty("xterm-256color", height, width, ssh.TerminalModes{
 		ssh.ECHO:          1,
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}); err != nil {
 		return nil, fmt.Errorf("sshterm: request pty: %w", err)
+	}
+	var cfg terminalOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	for name, value := range cfg.env {
+		_ = sess.Setenv(name, value) // best-effort: gated by sshd AcceptEnv
 	}
 	if err := sess.Shell(); err != nil {
 		return nil, fmt.Errorf("sshterm: start shell: %w", err)
@@ -103,8 +140,14 @@ func NewTerminal(sess PtySession, width, height int) (*Terminal, error) {
 	}
 	// Wire query responses (DSR cursor report, device attributes) back to the
 	// remote process's stdin. vim/less/tmux send these on startup and misbehave
-	// (or render stray digits like "10;?11;?") if no reply arrives.
+	// (or render stray digits like "10;11;?") if no reply arrives. The write
+	// takes writeMu: replies race UI-side input writes (keys, mouse events)
+	// on the same stream.
 	t.parser.SetResponder(func(b []byte) {
+		// stdin is read under the lock: Close nils it while holding writeMu,
+		// so checking outside the critical section would race it.
+		t.writeMu.Lock()
+		defer t.writeMu.Unlock()
 		if t.stdin != nil {
 			_, _ = t.stdin.Write(b)
 		}
@@ -165,6 +208,17 @@ func (t *Terminal) ApplicationCursor() bool {
 	return t.parser != nil && t.parser.ApplicationCursor()
 }
 
+// MouseConfig reports the xterm mouse reporting modes the remote program
+// enabled (htop setup dialogs, vim, tmux). While Reporting is true, mouse
+// events over the terminal pane must be forwarded to the remote program
+// instead of driving local selection/scrollback.
+func (t *Terminal) MouseConfig() MouseConfig {
+	if t.parser == nil {
+		return MouseConfig{}
+	}
+	return t.parser.MouseConfig()
+}
+
 // NewTerminalWithScreen builds a Terminal that has no live PTY but owns the
 // given Screen. It is intended for tests that exercise the Screen-backed
 // helpers (Scroll, View, rendering) without standing up a real SSH session.
@@ -192,26 +246,34 @@ func (t *Terminal) Done() <-chan struct{} { return t.done }
 // meaningful after Done is closed.
 func (t *Terminal) Err() error { t.mu.Lock(); defer t.mu.Unlock(); return t.err }
 
-// Resize updates the PTY size. Safe to call while running.
+// Resize updates the PTY size. Safe to call while running; the whole update
+// (stored size, screen buffers, PTY window) is serialized so two concurrent
+// calls can't interleave into a mixed state.
 func (t *Terminal) Resize(width, height int) error {
 	if width < 1 || height < 1 {
 		return fmt.Errorf("sshterm: invalid size %dx%d", width, height)
 	}
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.width, t.height = width, height
-	t.mu.Unlock()
-	// Keep the screen's buffers in sync with the PTY height: the alt buffer is a
-	// fixed-height viewport, and the main buffer uses the height as its scroll
-	// clamp ceiling.
+	// Keep the screen's buffers in sync with the PTY size: the alt buffer is a
+	// fixed-height viewport, the main buffer uses the height as its scroll
+	// clamp ceiling, and both use the width as their wrap width. A width
+	// change without the grid re-slice left remote programs drawing at the new
+	// width against a stale grid, wrapping full-width TUI boxes mid-screen.
 	if t.screen != nil {
 		t.screen.SetHeight(height)
+		t.screen.SetWidth(width)
 	}
 	return t.sess.WindowChange(height, width)
 }
 
 // WriteInput sends raw bytes (already-encoded key sequences) to the remote
-// shell's stdin.
+// shell's stdin. Serialized against the read loop's query replies; the ssh
+// channel writer is not safe for concurrent callers.
 func (t *Terminal) WriteInput(b []byte) error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	if t.stdin == nil {
 		return errors.New("sshterm: stdin not available")
 	}
@@ -219,12 +281,21 @@ func (t *Terminal) WriteInput(b []byte) error {
 	return err
 }
 
-// Close shuts down the terminal: cancels stdin and closes the session.
+// Close shuts down the terminal: closes the session, then cancels stdin.
+// The session is torn down FIRST deliberately: a query reply (DSR/DA) stuck
+// writing to a wedged SSH channel holds writeMu indefinitely, and taking the
+// lock before closing the session made Close hang forever on disconnect.
+// Closing the session fails the blocked channel write, which releases the
+// lock so the stdin cleanup below can always proceed.
 func (t *Terminal) Close() error {
+	err := t.sess.Close()
+	t.writeMu.Lock()
 	if t.stdin != nil {
 		_ = t.stdin.Close()
+		t.stdin = nil
 	}
-	return t.sess.Close()
+	t.writeMu.Unlock()
+	return err
 }
 
 func (t *Terminal) readLoop(ctx context.Context) {

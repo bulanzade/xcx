@@ -25,8 +25,10 @@ type Parser struct {
 
 	state   parseState
 	params  []int  // parsed CSI parameters
+	subs    []bool // parallel to params: slot began after ':' (sub-parameter)
 	cur     int    // current parameter accumulator
 	hasNum  bool   // whether cur holds any digit
+	curSub  bool   // whether the slot being accumulated follows a ':'
 	interm  []byte // intermediate bytes 0x20..0x2f (mostly ignored)
 	private byte   // private parameter prefix 0x3c..0x3f (0 = none), e.g. '?' for DEC modes
 	utfbuf  []byte // leftover incomplete UTF-8 sequence
@@ -42,6 +44,90 @@ type Parser struct {
 
 	bracketedPaste    atomic.Bool
 	applicationCursor atomic.Bool
+	mouseMode         atomic.Uint32
+}
+
+// xterm mouse reporting mode bits, set/reset by CSI ? Pm h / l. Tracking modes
+// (?9/?1000/?1002/?1003) ask the terminal to report mouse events back to the
+// remote program; encoding flags (?1005/?1006) select how.
+const (
+	mouseTrackX10    = 1 << iota // ?9: press-only, classic encoding
+	mouseTrackNormal             // ?1000: press + release
+	mouseTrackButton             // ?1002: + motion while a button is held
+	mouseTrackAny                // ?1003: + all motion
+	mouseEncUTF8                 // ?1005: UTF-8 coordinate encoding (tracked so reset works)
+	mouseEncSGR                  // ?1006: SGR (CSI < b;x;y M/m) encoding
+
+	mouseTrackOn = mouseTrackX10 | mouseTrackNormal | mouseTrackButton | mouseTrackAny
+)
+
+// MouseConfig is the mouse reporting state the remote program requested.
+type MouseConfig struct {
+	// Reporting is true when any tracking mode is on. While it is, mouse
+	// events over the terminal pane belong to the remote program (htop setup
+	// dialogs, vim, tmux) and must be forwarded as escape sequences instead
+	// of driving local selection/scrollback.
+	Reporting bool
+	// SGR selects the SGR encoding (?1006) over the classic 3-byte X10 form.
+	SGR bool
+	// UTF8 selects the UTF-8 coordinate encoding (?1005) inside the classic
+	// form (coordinates beyond 127 are encoded as multi-byte UTF-8).
+	UTF8 bool
+	// X10 is the ?9 mode: press events only, classic encoding.
+	X10 bool
+	// Motion says which motion events to forward: 0 none, 1 only while a
+	// button is held (?1002), 2 all motion (?1003).
+	Motion int
+}
+
+// MouseConfig reports the mouse reporting modes currently enabled.
+func (p *Parser) MouseConfig() MouseConfig {
+	m := p.mouseMode.Load()
+	cfg := MouseConfig{
+		Reporting: m&mouseTrackOn != 0,
+		SGR:       m&mouseEncSGR != 0,
+		UTF8:      m&mouseEncUTF8 != 0,
+		X10:       m&mouseTrackX10 != 0,
+	}
+	switch {
+	case m&mouseTrackAny != 0:
+		cfg.Motion = 2
+	case m&mouseTrackButton != 0:
+		cfg.Motion = 1
+	}
+	return cfg
+}
+
+func (p *Parser) setMouseMode(bit uint32, on bool) {
+	for {
+		old := p.mouseMode.Load()
+		next := old &^ bit
+		if on {
+			next |= bit
+		}
+		if p.mouseMode.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// setMouseTracking switches the active tracking mode. ?9/?1000/?1002/?1003
+// select one protocol, not additive flags: enabling a mode replaces whichever
+// tracking mode was active before it, and disabling clears the group.
+// Additive bits let a stale mode survive a switch — enable ?1003, enable
+// ?1000, disable ?1000 left motion tracking silently on, so the pane kept
+// swallowing the mouse after the remote program turned reporting off.
+func (p *Parser) setMouseTracking(bit uint32, on bool) {
+	for {
+		old := p.mouseMode.Load()
+		next := old &^ mouseTrackOn
+		if on {
+			next |= bit
+		}
+		if p.mouseMode.CompareAndSwap(old, next) {
+			return
+		}
+	}
 }
 
 // Responder is the interface for sending response bytes back to the remote
@@ -349,8 +435,10 @@ func hasOSCParam(body []byte, prefix string) bool {
 func (p *Parser) enterCSI() {
 	p.state = stCSI
 	p.params = p.params[:0]
+	p.subs = p.subs[:0]
 	p.cur = 0
 	p.hasNum = false
+	p.curSub = false
 	p.interm = p.interm[:0]
 	p.private = 0
 }
@@ -360,10 +448,18 @@ func (p *Parser) handleCSI(r rune) {
 	case r >= '0' && r <= '9':
 		p.cur = p.cur*10 + int(r-'0')
 		p.hasNum = true
-	case r == ';':
+	case r == ';' || r == ':':
+		// ';' separates parameters; ':' separates SUB-parameters (ECMA-48
+		// 0x3a), e.g. SGR 38:5:n or 4:3. Both flatten into one param list so
+		// the sequence is consumed (without this the parser aborted on ':'
+		// and the digits leaked as visible text), but the slot is flagged in
+		// p.subs so SGR dispatch never reinterprets a sub-parameter as an
+		// independent code (4:3 must not become "underline;italic").
 		p.params = append(p.params, p.curOrDefault(0))
+		p.subs = append(p.subs, p.curSub)
 		p.cur = 0
 		p.hasNum = false
+		p.curSub = r == ':'
 	case r >= 0x3c && r <= 0x3f: // private parameter prefix: <=>? (e.g. CSI ?2004 h)
 		// These mark a "private" sequence (DEC modes, bracketed paste, etc.).
 		// We record the marker so dispatch knows it's private, then keep
@@ -375,6 +471,7 @@ func (p *Parser) handleCSI(r rune) {
 		// flush last param if any digits were seen since last ';'
 		if p.hasNum || len(p.params) > 0 {
 			p.params = append(p.params, p.curOrDefault(0))
+			p.subs = append(p.subs, p.curSub)
 		}
 		p.dispatchCSI(r)
 		p.state = stGround
@@ -433,23 +530,40 @@ func (p *Parser) dispatchCSI(final rune) {
 		}
 	}
 
-	// Private sequences (CSI ? ... h/l). Act on ?1/?47/?1047/?1049/?2004;
+	// Private sequences (CSI ? ... h/l). Act on the DEC modes we implement;
 	// drop the rest (e.g. ?25 cursor visibility, ?6 origin mode) fully so their
-	// digits don't leak as text.
+	// digits don't leak as text. Every parameter in the list takes effect —
+	// programs combine modes in one sequence (htop enables mouse reporting as
+	// CSI ? 1006;1000 h), and checking only the first parameter silently
+	// dropped the rest.
 	if p.private != 0 {
 		if p.private == '?' && len(p.params) > 0 && (final == 'h' || final == 'l') {
 			enabled := final == 'h'
-			switch p.params[0] {
-			case 1: // DECCKM: application cursor keys on/off.
-				p.applicationCursor.Store(enabled)
-			case 47, 1047, 1049: // alternate screen (?1049 cursor save/restore not implemented).
-				if enabled {
-					p.screen.EnterAltScreen()
-				} else {
-					p.screen.LeaveAltScreen()
+			for _, v := range p.params {
+				switch v {
+				case 1: // DECCKM: application cursor keys on/off.
+					p.applicationCursor.Store(enabled)
+				case 47, 1047, 1049: // alternate screen (?1049 cursor save/restore not implemented).
+					if enabled {
+						p.screen.EnterAltScreen()
+					} else {
+						p.screen.LeaveAltScreen()
+					}
+				case 2004: // bracketed paste mode.
+					p.bracketedPaste.Store(enabled)
+				case 9: // X10 mouse tracking: press-only.
+					p.setMouseTracking(mouseTrackX10, enabled)
+				case 1000: // normal mouse tracking: press + release.
+					p.setMouseTracking(mouseTrackNormal, enabled)
+				case 1002: // button-event tracking: + motion with a button held.
+					p.setMouseTracking(mouseTrackButton, enabled)
+				case 1003: // any-event tracking: + all motion.
+					p.setMouseTracking(mouseTrackAny, enabled)
+				case 1005: // UTF-8 mouse coordinate encoding.
+					p.setMouseMode(mouseEncUTF8, enabled)
+				case 1006: // SGR mouse encoding.
+					p.setMouseMode(mouseEncSGR, enabled)
 				}
-			case 2004: // bracketed paste mode.
-				p.bracketedPaste.Store(enabled)
 			}
 		}
 		return
@@ -500,16 +614,23 @@ func (p *Parser) dispatchCSI(final rune) {
 	}
 }
 
-// applySGR interprets CSI ... m parameters into p.style.
+// applySGR interprets CSI ... m parameters into p.style. Sub-parameters
+// (slots after ':') belong to their owning code and are never reinterpreted
+// as independent SGR codes — 4:3 is an underline style, not "underline;italic",
+// and 58:… (underline color) is consumed without touching the style.
 func (p *Parser) applySGR() {
 	if len(p.params) == 0 {
 		p.params = append(p.params, 0)
+		p.subs = append(p.subs, false)
 	}
 	for i := 0; i < len(p.params); i++ {
+		if p.isSub(i) {
+			continue // sub-parameter of the preceding code
+		}
 		v := p.params[i]
 		switch {
 		case v == 0:
-			p.style = Style{Fg: -1, Bg: -1}
+			p.style = Style{Fg: ColorDefault, Bg: ColorDefault}
 		case v == 1:
 			p.style.Bold = true
 		case v == 2:
@@ -518,6 +639,12 @@ func (p *Parser) applySGR() {
 			p.style.Italic = true
 		case v == 4:
 			p.style.Under = true
+			// 4:0..5 selects an underline style (0 = none); any nonzero
+			// style still means underlined for our rendering.
+			if i+1 < len(p.params) && p.isSub(i+1) {
+				i++
+				p.style.Under = p.params[i] != 0
+			}
 		case v == 7:
 			p.style.Rev = true
 		case v == 22:
@@ -530,23 +657,92 @@ func (p *Parser) applySGR() {
 		case v == 27:
 			p.style.Rev = false
 		case v >= 30 && v <= 37:
-			p.style.Fg = int8(v - 30)
+			p.style.Fg = Color(v - 30)
 		case v == 39:
-			p.style.Fg = -1
+			p.style.Fg = ColorDefault
 		case v >= 40 && v <= 47:
-			p.style.Bg = int8(v - 40)
+			p.style.Bg = Color(v - 40)
 		case v == 49:
-			p.style.Bg = -1
-		case v == 38 || v == 48:
-			// 256-color / truecolor: skip the next param(s)
-			if i+1 < len(p.params) {
-				mode := p.params[i+1]
-				if mode == 5 && i+2 < len(p.params) {
-					i += 2
-				} else if mode == 2 && i+4 < len(p.params) {
-					i += 4
-				}
-			}
+			p.style.Bg = ColorDefault
+		case v >= 90 && v <= 97:
+			p.style.Fg = Color(v - 90 + 8)
+		case v >= 100 && v <= 107:
+			p.style.Bg = Color(v - 100 + 8)
+		case v == 38:
+			i = p.applyExtendedColor(i, &p.style.Fg)
+		case v == 48:
+			i = p.applyExtendedColor(i, &p.style.Bg)
+		case v == 58:
+			// Underline color: same argument shapes as 38/48; we don't render
+			// colored underlines, but the arguments must be consumed.
+			i = p.applyExtendedColor(i, nil)
 		}
 	}
+}
+
+// isSub reports whether params slot i began after ':' (a sub-parameter).
+func (p *Parser) isSub(i int) bool { return i < len(p.subs) && p.subs[i] }
+
+// applyExtendedColor parses the 256-color (38;5;n) and truecolor (38;2;r;g;b)
+// SGR forms starting at params[i] (which holds 38, 48 or 58), stores the color
+// through target (nil = consume the arguments only, used for 58 underline
+// color which we don't render), and returns the index of the last consumed
+// parameter. Modern TUIs (codex, bubbletea/lipgloss apps like pi) color almost
+// everything through these forms, so they must set a real Color — dropping
+// them (as an earlier revision did) rendered those interfaces monochrome.
+// Missing trailing values default to 0 and are still consumed, mirroring
+// xterm's parsing; out-of-range values are clamped/masked. The colon form
+// with an empty colorspace slot (38:2::r:g:b, emitted by kitty and nvim)
+// skips that slot before the three channels.
+func (p *Parser) applyExtendedColor(i int, target *Color) int {
+	if i+1 >= len(p.params) {
+		return i
+	}
+	end := i
+	var c Color
+	switch p.params[i+1] {
+	case 5: // palette index: 38;5;n
+		n := 0
+		end = i + 1
+		if i+2 < len(p.params) {
+			n = p.params[i+2]
+			end = i + 2
+		}
+		c = PaletteColor(n)
+	case 2: // direct color: 38;2;r;g;b, 38:2:cs:r:g:b, 38:2::r:g:b
+		base := i + 2
+		last := len(p.params) - 1
+		if p.isSub(i + 1) {
+			// Colon form: the values after the mode form one ':'-group. The
+			// group only carries a leading colorspace slot when it holds four
+			// values (colorspace + the 3 channels; kitty's 38:2::r:g:b is
+			// that shape with an empty colorspace). The group's end is a hard
+			// boundary — reading past it swallowed the next ';'-separated
+			// attribute, so 38:2:0:128:64;1m came out as RGB(128,64,1)
+			// without its bold.
+			groupEnd := base
+			for groupEnd < len(p.params) && p.isSub(groupEnd) {
+				groupEnd++
+			}
+			if groupEnd-base >= 4 {
+				base++
+			}
+			last = groupEnd - 1
+		}
+		r, g, b := 0, 0, 0
+		end = base - 1
+		for k, ch := range [3]*int{&r, &g, &b} {
+			if idx := base + k; idx <= last {
+				*ch = p.params[idx]
+				end = idx
+			}
+		}
+		c = RGBColor(r, g, b)
+	default:
+		return i
+	}
+	if target != nil {
+		*target = c
+	}
+	return end
 }

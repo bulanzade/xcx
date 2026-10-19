@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -21,6 +22,12 @@ type terminalModel struct {
 	ticking    bool
 	writeInput func([]byte) error
 	selection  terminalSelection
+	// fwdMousePress is true between a mouse press we forwarded to the remote
+	// program and its release. Releases arriving outside the terminal pane
+	// (drag onto a pane border, release over another panel) must still be
+	// forwarded so remote selections and drags complete instead of leaving
+	// the remote program with a button it never sees released.
+	fwdMousePress bool
 }
 
 func newTerminalModel() terminalModel {
@@ -68,7 +75,14 @@ func openTerminalCmd(app *App, sess *session.Session, connKey string) tea.Cmd {
 		if err != nil {
 			return terminalErrorMsg{sess: sess, err: fmt.Errorf("new session: %w", err)}
 		}
-		term, err := sshterm.NewTerminal(sshSess, w, h)
+		var opts []sshterm.TerminalOption
+		if localTrueColor() {
+			// Forward the local terminal's 24-bit capability so remote TUIs
+			// (codex, pi, …) emit their native palette instead of downsampling
+			// to 256 colors. Best-effort: sshd's AcceptEnv gates env requests.
+			opts = append(opts, sshterm.WithEnv("COLORTERM", "truecolor"))
+		}
+		term, err := sshterm.NewTerminal(sshSess, w, h, opts...)
 		if err != nil {
 			return terminalErrorMsg{sess: sess, err: err}
 		}
@@ -76,6 +90,19 @@ func openTerminalCmd(app *App, sess *session.Session, connKey string) tea.Cmd {
 		term.Start(ctx)
 		return terminalStartedMsg{sess: sess, key: connKey, term: term, ctx: ctx, cancel: cancel}
 	}
+}
+
+// localTrueColor reports whether the terminal xcx runs in advertised 24-bit
+// color support (COLORTERM=truecolor/24bit, set by Windows Terminal, iTerm2,
+// kitty, alacritty, wezterm, VTE-based terminals, …). Inside tmux without
+// pass-through config COLORTERM is absent, correctly downgrading the remote
+// side to TERM=xterm-256color.
+func localTrueColor() bool {
+	switch os.Getenv("COLORTERM") {
+	case "truecolor", "24bit":
+		return true
+	}
+	return false
 }
 
 type terminalStartedMsg struct {
@@ -126,6 +153,13 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 		if m.term == nil {
 			return m, nil
 		}
+		// RightSize() shrank by the terminal pane's border (2 cols/rows) when
+		// app.right switched to rightTerminal just above — but openTerminalCmd
+		// captured the size BEFORE the switch. Sync the corrected size to the
+		// PTY and screen now; without this the PTY stayed wider than the render
+		// area and full-width box borders (pi's input box) were clipped.
+		w, h := app.RightSize()
+		_ = m.term.Resize(w, h)
 		return m, tea.Batch(terminalRefresh(), waitForTerminalDone(m.term))
 	case terminalErrorMsg:
 		app.err = fmt.Sprintf("terminal: %v", msg.err)
@@ -279,6 +313,34 @@ func (m terminalModel) Update(app *App, msg tea.Msg) (terminalModel, tea.Cmd) {
 }
 
 func (m terminalModel) handleMouse(app *App, msg terminalMouseMsg) (terminalModel, tea.Cmd) {
+	// While the remote program owns the mouse (it enabled xterm mouse
+	// reporting: htop's setup dialogs, vim, tmux), forward events to it
+	// instead of driving local selection/scrollback. SHIFT bypasses the app,
+	// matching xterm, so the wheel still scrolls local history.
+	if cfg := m.mouseConfig(); cfg.Reporting && !msg.msg.Shift {
+		if msg.inside {
+			if msg.msg.Action == tea.MouseActionPress && isPlainButton(msg.msg.Button) {
+				m.fwdMousePress = true
+			}
+			m.forwardMouse(app, msg, cfg)
+			if msg.msg.Action == tea.MouseActionRelease {
+				m.fwdMousePress = false
+			}
+			return m, nil
+		}
+		if m.fwdMousePress && msg.msg.Action == tea.MouseActionRelease {
+			// A press we forwarded must not strand the remote program: drag
+			// out of the pane and release still forwards the release, with
+			// the pane-clamped coordinates forwardMouse computes.
+			m.fwdMousePress = false
+			m.forwardMouse(app, msg, cfg)
+			return m, nil
+		}
+	} else {
+		// Reporting off (or SHIFT held): local handling owns the mouse now;
+		// don't let a press from before the switch look unreleased.
+		m.fwdMousePress = false
+	}
 	switch msg.msg.Button {
 	case tea.MouseButtonWheelUp:
 		if msg.inside && msg.msg.Action == tea.MouseActionPress {
@@ -351,6 +413,120 @@ func (m terminalModel) write(input []byte) error {
 		return m.writeInput(input)
 	}
 	return m.term.WriteInput(input)
+}
+
+// mouseConfig returns the mouse reporting state the remote program requested,
+// zero value when no terminal is attached.
+func (m terminalModel) mouseConfig() sshterm.MouseConfig {
+	if m.term == nil {
+		return sshterm.MouseConfig{}
+	}
+	return m.term.MouseConfig()
+}
+
+// forwardMouse encodes one mouse event in the encoding the remote program
+// asked for (SGR "CSI < b;x;y M/m" with ?1006, otherwise the classic 3-byte
+// "CSI M" form) and writes it to the PTY. col/row are 0-based pane cells;
+// xterm mouse coordinates are 1-based.
+func (m terminalModel) forwardMouse(app *App, msg terminalMouseMsg, cfg sshterm.MouseConfig) {
+	e := msg.msg
+	if e.Action == tea.MouseActionMotion {
+		if cfg.Motion == 0 || (cfg.Motion == 1 && e.Button == tea.MouseButtonNone) {
+			return
+		}
+	}
+	if e.Action == tea.MouseActionRelease && cfg.X10 {
+		// The X10 protocol reports presses only — in any encoding, SGR
+		// included; letting releases through under ?1006 gave press-only
+		// applications events they never asked for.
+		return
+	}
+
+	cb := mouseButtonCode(e)
+	if e.Action == tea.MouseActionMotion {
+		cb |= 32
+	}
+	if e.Alt {
+		cb |= 8
+	}
+	if e.Ctrl {
+		cb |= 16
+	}
+	// Both classic encodings (?1005 and the plain byte form) mark a release
+	// by forcing the button bits to 11 while keeping the modifiers; SGR
+	// instead uses the 'm' final byte. Skipping this under ?1005 made every
+	// release decode as another press of the same button.
+	if !cfg.SGR && e.Action == tea.MouseActionRelease {
+		cb = cb&^3 | 3
+	}
+
+	col, row := msg.col+1, msg.row+1
+	if col < 1 {
+		col = 1
+	}
+	if row < 1 {
+		row = 1
+	}
+
+	var b []byte
+	if cfg.SGR {
+		final := byte('M')
+		if e.Action == tea.MouseActionRelease && e.Button != tea.MouseButtonWheelUp && e.Button != tea.MouseButtonWheelDown {
+			final = 'm'
+		}
+		b = []byte(fmt.Sprintf("\x1b[<%d;%d;%d%c", cb, col, row, final))
+	} else if cfg.UTF8 {
+		// ?1005: the classic form with coordinates encoded as UTF-8 runes so
+		// panes beyond column 95 still report; the button byte stays ASCII.
+		b = []byte("\x1b[M" + string([]rune{rune(32 + cb), rune(32 + col), rune(32 + row)}))
+	} else {
+		// Plain classic X10 form: coordinates are raw bytes biased by 32 and
+		// cap at 223 (byte 255).
+		if col > 223 {
+			col = 223
+		}
+		if row > 223 {
+			row = 223
+		}
+		b = []byte{'\x1b', '[', 'M', byte(32 + cb), byte(32 + col), byte(32 + row)}
+	}
+	if err := m.write(b); err != nil {
+		app.err = fmt.Sprintf("mouse: %v", err)
+	}
+}
+
+// isPlainButton reports whether b is a real mouse button (not wheel or
+// none): only plain buttons have a release event to remember between the
+// press and its release.
+func isPlainButton(b tea.MouseButton) bool {
+	switch b {
+	case tea.MouseButtonLeft, tea.MouseButtonMiddle, tea.MouseButtonRight:
+		return true
+	}
+	return false
+}
+
+// mouseButtonCode maps a bubbletea button to the xterm mouse button number
+// (0=left, 1=middle, 2=right, 3=none/motion, 64-67=wheel).
+func mouseButtonCode(e tea.MouseMsg) int {
+	switch e.Button {
+	case tea.MouseButtonLeft:
+		return 0
+	case tea.MouseButtonMiddle:
+		return 1
+	case tea.MouseButtonRight:
+		return 2
+	case tea.MouseButtonWheelUp:
+		return 64
+	case tea.MouseButtonWheelDown:
+		return 65
+	case tea.MouseButtonWheelLeft:
+		return 66
+	case tea.MouseButtonWheelRight:
+		return 67
+	default:
+		return 3
+	}
 }
 
 func (m terminalModel) writePaste(input string) error {

@@ -199,6 +199,12 @@ func (m sftpModel) Update(app *App, msg tea.Msg) (sftpModel, tea.Cmd) {
 		if app.terminal.term != nil {
 			app.right = rightTerminal
 			app.focus = focusRight
+			// RightSize() changed with the pane switch (terminal border);
+			// re-sync the PTY so remote full-width UIs line up with the
+			// render area — the terminal missed WindowSizeMsg while SFTP
+			// owned the right pane.
+			tw, th := app.RightSize()
+			_ = app.terminal.term.Resize(tw, th)
 		} else {
 			app.right = rightPlaceholder
 			app.focus = focusLeft

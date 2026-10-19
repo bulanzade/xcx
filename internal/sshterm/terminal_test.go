@@ -25,6 +25,8 @@ type fakePtySession struct {
 	mu                 sync.Mutex
 	ptyW, ptyH         int
 	changedW, changedH int
+	ptyTerm            string
+	env                map[string]string
 
 	closed       bool
 	shellStarted bool
@@ -51,6 +53,18 @@ func (e errorReader) Read(p []byte) (int, error) { return 0, e.err }
 func (f *fakePtySession) RequestPty(term string, h, w int, modes ssh.TerminalModes) error {
 	f.ptyRequested = true
 	f.ptyW, f.ptyH = w, h
+	f.ptyTerm = term
+	return nil
+}
+func (f *fakePtySession) Setenv(name, value string) error {
+	if f.shellStarted {
+		// Mirror the real ssh.Session rule: env must be set before Shell().
+		return errors.New("ssh: Setenv after process started")
+	}
+	if f.env == nil {
+		f.env = map[string]string{}
+	}
+	f.env[name] = value
 	return nil
 }
 func (f *fakePtySession) Shell() error { f.shellStarted = true; return nil }
@@ -207,6 +221,31 @@ func TestTerminal_CloseSetsClosed(t *testing.T) {
 	}
 	if !fake.closed {
 		t.Fatal("session not closed")
+	}
+}
+
+// TestTerminal_PtyTerm256Color is a regression test for the monochrome-AI-TUI
+// bug: the PTY advertised TERM=xterm (8 colors), so remote programs that probe
+// terminfo (codex, pi/lipgloss, htop) downgraded their palette. The PTY must
+// declare xterm-256color.
+func TestTerminal_PtyTerm256Color(t *testing.T) {
+	fake := newFakePty("")
+	term, _ := NewTerminal(fake, 80, 24)
+	defer term.Close()
+	if fake.ptyTerm != "xterm-256color" {
+		t.Fatalf("pty TERM = %q, want xterm-256color", fake.ptyTerm)
+	}
+}
+
+// TestTerminal_WithEnvBeforeShell verifies WithEnv pairs reach the remote via
+// Setenv before Shell() starts (the ordering the real ssh.Session enforces;
+// the fake rejects Setenv after Shell).
+func TestTerminal_WithEnvBeforeShell(t *testing.T) {
+	fake := newFakePty("")
+	term, _ := NewTerminal(fake, 80, 24, WithEnv("COLORTERM", "truecolor"))
+	defer term.Close()
+	if got := fake.env["COLORTERM"]; got != "truecolor" {
+		t.Fatalf("COLORTERM = %q, want truecolor", got)
 	}
 }
 
